@@ -8,8 +8,14 @@ inclusion: always
 - **Runtime**: Node.js with TypeScript (strict mode)
 - **Framework**: Next.js 14 with App Router
 - **UI**: React with Tailwind CSS
-- **AI**: OpenAI GPT-4 via the AI SDK (`ai` package from Vercel)
-- **Database**: SQLite via better-sqlite3 for persistence (file-based, zero setup)
+- **AI**: Amazon Bedrock (Claude) via AWS SDK for AI Architect agent
+- **Database**: Amazon DynamoDB for persistence (rooms, threads, messages, ADRs)
+- **Search**: Amazon OpenSearch Serverless for full-text decision journal search
+- **Storage**: Amazon S3 for diagram artifacts and exported ADR documents
+- **Auth**: Amazon Cognito for user authentication and team-based authorization
+- **Compute**: AWS Lambda + API Gateway for backend APIs
+- **Frontend Hosting**: AWS Amplify for Next.js deployment
+- **IaC**: AWS CDK (TypeScript) for infrastructure definitions
 - **State**: React Context + SWR for client-side data fetching
 
 ## Project Structure
@@ -24,8 +30,16 @@ src/
     adr-generator.ts
     cross-reference.ts
     decision-journal.ts
-  db/               # Database schema and access layer
+  services/         # AWS service integrations
+    bedrock.ts      # Amazon Bedrock client for Claude
+    dynamo.ts       # DynamoDB document client
+    opensearch.ts   # OpenSearch Serverless client
+    s3.ts           # S3 operations for diagrams/ADRs
+    cognito.ts      # Cognito auth helpers
   types/            # TypeScript interfaces and type definitions
+infra/              # AWS CDK infrastructure definitions
+  lib/
+    chalk-stack.ts  # Main CDK stack
 ```
 
 ## Conventions
