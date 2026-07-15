@@ -10,7 +10,7 @@ inclusion: always
 - **UI**: React with Tailwind CSS
 - **AI**: Amazon Bedrock (Claude) via AWS SDK for AI Architect agent
 - **Database**: Amazon DynamoDB for persistence (rooms, threads, messages, ADRs)
-- **Search**: Amazon OpenSearch Serverless for full-text decision journal search
+- **Search**: Amazon Bedrock Titan Embeddings + DynamoDB for semantic search (no OpenSearch needed)
 - **Storage**: Amazon S3 for diagram artifacts and exported ADR documents
 - **Auth**: Amazon Cognito for user authentication and team-based authorization
 - **Compute**: AWS Lambda + API Gateway for backend APIs
@@ -31,9 +31,8 @@ src/
     cross-reference.ts
     decision-journal.ts
   services/         # AWS service integrations
-    bedrock.ts      # Amazon Bedrock client for Claude
+    bedrock.ts      # Amazon Bedrock client for Claude + Titan Embeddings
     dynamo.ts       # DynamoDB document client
-    opensearch.ts   # OpenSearch Serverless client
     s3.ts           # S3 operations for diagrams/ADRs
     cognito.ts      # Cognito auth helpers
   types/            # TypeScript interfaces and type definitions
