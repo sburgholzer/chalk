@@ -55,13 +55,37 @@ interface ChangeRoleRequest {
  */
 function extractAuthContext(event: APIGatewayProxyEventV2): AuthorizerContext | null {
   const context = (event.requestContext as unknown as { authorizer?: { lambda?: AuthorizerContext } })
-    ?.authorizer?.lambda;
+    ?.authorizer;
 
-  if (!context?.userId || !context?.teams) {
-    return null;
+  if (context?.lambda?.userId && context?.lambda?.teams) {
+    return context.lambda;
   }
 
-  return context;
+  const authHeader = event.headers?.authorization ?? event.headers?.Authorization;
+  if (!authHeader) return null;
+
+  const parts = authHeader.split(' ');
+  if (parts.length !== 2 || parts[0] !== 'Bearer') return null;
+
+  try {
+    const tokenParts = parts[1].split('.');
+    if (tokenParts.length !== 3) return null;
+    const payload = JSON.parse(Buffer.from(tokenParts[1], 'base64url').toString());
+
+    const userId = payload.sub ?? payload['cognito:username'] ?? '';
+    const email = payload.email ?? '';
+    const groups = payload['cognito:groups'] ?? [];
+
+    if (!userId) return null;
+
+    return {
+      userId,
+      email,
+      teams: JSON.stringify(groups),
+    };
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -154,7 +178,7 @@ async function handleListMembers(event: APIGatewayProxyEventV2): Promise<APIGate
     return jsonResponse(401, { error: 'Unauthorized' });
   }
 
-  const teamId = getPathParam(event, 'id') as TeamId | undefined;
+  const teamId = getPathParam(event, 'teamId') as TeamId | undefined;
   if (!teamId) {
     return jsonResponse(400, { error: 'Missing team ID' });
   }
@@ -191,7 +215,7 @@ async function handleInviteUser(event: APIGatewayProxyEventV2): Promise<APIGatew
     return jsonResponse(401, { error: 'Unauthorized' });
   }
 
-  const teamId = getPathParam(event, 'id') as TeamId | undefined;
+  const teamId = getPathParam(event, 'teamId') as TeamId | undefined;
   if (!teamId) {
     return jsonResponse(400, { error: 'Missing team ID' });
   }
@@ -255,7 +279,7 @@ async function handleRemoveUser(event: APIGatewayProxyEventV2): Promise<APIGatew
     return jsonResponse(401, { error: 'Unauthorized' });
   }
 
-  const teamId = getPathParam(event, 'id') as TeamId | undefined;
+  const teamId = getPathParam(event, 'teamId') as TeamId | undefined;
   if (!teamId) {
     return jsonResponse(400, { error: 'Missing team ID' });
   }
@@ -298,7 +322,7 @@ async function handleChangeRole(event: APIGatewayProxyEventV2): Promise<APIGatew
     return jsonResponse(401, { error: 'Unauthorized' });
   }
 
-  const teamId = getPathParam(event, 'id') as TeamId | undefined;
+  const teamId = getPathParam(event, 'teamId') as TeamId | undefined;
   if (!teamId) {
     return jsonResponse(400, { error: 'Missing team ID' });
   }

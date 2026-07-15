@@ -4,15 +4,20 @@ import useSWR, { mutate } from 'swr';
 import { Room } from '@/types/domain';
 import { RoomList } from '@/components/RoomList';
 import { RoomCreateForm } from '@/components/RoomCreateForm';
-import { authFetcher, authRequest } from '@/lib/auth';
+import { authFetcher, authRequest, getAccessToken } from '@/lib/auth';
+import { useAuth } from '@/components/AuthProvider';
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL ?? '';
 
 export function RoomsPage() {
-  const { data: rooms, error, isLoading } = useSWR<Room[]>(
-    `${API_URL}/rooms`,
+  const { isAuthenticated, isLoading: authLoading } = useAuth();
+
+  const { data, error, isLoading } = useSWR<{ rooms: Room[] }>(
+    isAuthenticated ? `${API_URL}/rooms` : null,
     authFetcher
   );
+
+  const rooms = data?.rooms ?? [];
 
   async function handleCreateRoom(name: string) {
     await authRequest(`${API_URL}/rooms`, {
@@ -23,7 +28,22 @@ export function RoomsPage() {
     mutate(`${API_URL}/rooms`);
   }
 
-  const existingNames = rooms?.map((r) => r.name) ?? [];
+  const existingNames = rooms.map((r) => r.name);
+
+  if (authLoading) {
+    return (
+      <main className="mx-auto max-w-3xl px-4 py-8">
+        <p className="text-gray-500">Loading...</p>
+      </main>
+    );
+  }
+
+  if (!isAuthenticated) {
+    if (typeof window !== 'undefined') {
+      window.location.href = '/login';
+    }
+    return null;
+  }
 
   return (
     <main className="mx-auto max-w-3xl px-4 py-8">
@@ -46,7 +66,7 @@ export function RoomsPage() {
         <h2 className="text-lg font-semibold text-gray-800">Your Rooms</h2>
         <div className="mt-3">
           <RoomList
-            rooms={rooms ?? []}
+            rooms={rooms}
             isLoading={isLoading}
             error={error?.message}
           />

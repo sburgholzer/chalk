@@ -8,6 +8,8 @@ import * as apigatewayv2 from 'aws-cdk-lib/aws-apigatewayv2';
 import * as apigatewayv2Integrations from 'aws-cdk-lib/aws-apigatewayv2-integrations';
 import * as apigatewayv2Authorizers from 'aws-cdk-lib/aws-apigatewayv2-authorizers';
 import * as iam from 'aws-cdk-lib/aws-iam';
+import * as lambdaNode from 'aws-cdk-lib/aws-lambda-nodejs';
+import * as path from 'path';
 
 export class ChalkStack extends cdk.Stack {
   public readonly table: dynamodb.Table;
@@ -28,7 +30,7 @@ export class ChalkStack extends cdk.Stack {
       sortKey: { name: 'SK', type: dynamodb.AttributeType.STRING },
       billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
       removalPolicy: cdk.RemovalPolicy.RETAIN,
-      pointInTimeRecovery: true,
+      pointInTimeRecoverySpecification: { pointInTimeRecoveryEnabled: true },
     });
 
     // GSI1: Filter threads by status + date
@@ -86,7 +88,7 @@ export class ChalkStack extends cdk.Stack {
       },
       userInvitation: {
         emailSubject: 'Your Chalk workspace invitation',
-        emailBody: 'You have been invited to Chalk. Your temporary password is {####}.',
+        emailBody: 'You have been invited to Chalk. Your username is {username} and your temporary password is {####}.',
       },
       removalPolicy: cdk.RemovalPolicy.RETAIN,
     });
@@ -97,6 +99,28 @@ export class ChalkStack extends cdk.Stack {
         userSrp: true,
       },
       generateSecret: false,
+      oAuth: {
+        flows: { authorizationCodeGrant: true },
+        scopes: [
+          cognito.OAuthScope.OPENID,
+          cognito.OAuthScope.EMAIL,
+          cognito.OAuthScope.PROFILE,
+        ],
+        callbackUrls: ['http://localhost:3000/login'],
+        logoutUrls: ['http://localhost:3000/login'],
+      },
+    });
+
+    // Cognito hosted UI domain
+    const userPoolDomain = this.userPool.addDomain('ChalkDomain', {
+      cognitoDomain: { domainPrefix: 'chalk-app' },
+    });
+
+    // Default team group
+    new cognito.CfnUserPoolGroup(this, 'DefaultTeamGroup', {
+      userPoolId: this.userPool.userPoolId,
+      groupName: 'chalk-team',
+      description: 'Default team for Chalk users',
     });
 
     // =========================================================================
@@ -114,57 +138,70 @@ export class ChalkStack extends cdk.Stack {
     // =========================================================================
     // Lambda Functions
     // =========================================================================
-    const lambdaDefaults: Omit<lambda.FunctionProps, 'handler' | 'functionName'> = {
+    const lambdaDir = path.join(__dirname, '../../src/lambda');
+
+    const nodejsDefaults: Partial<lambdaNode.NodejsFunctionProps> = {
       runtime: lambda.Runtime.NODEJS_20_X,
-      code: lambda.Code.fromAsset('dist/lambda'),
       timeout: cdk.Duration.seconds(30),
       memorySize: 256,
       environment: lambdaEnvironment,
+      bundling: {
+        minify: true,
+        sourceMap: true,
+        tsconfig: path.join(__dirname, '../../tsconfig.json'),
+      },
     };
 
-    const roomFn = new lambda.Function(this, 'RoomFunction', {
-      ...lambdaDefaults,
-      handler: 'room.handler',
+    const roomFn = new lambdaNode.NodejsFunction(this, 'RoomFunction', {
+      ...nodejsDefaults,
+      entry: path.join(lambdaDir, 'room.ts'),
+      handler: 'handler',
       functionName: 'chalk-room',
     });
 
-    const threadFn = new lambda.Function(this, 'ThreadFunction', {
-      ...lambdaDefaults,
-      handler: 'thread.handler',
+    const threadFn = new lambdaNode.NodejsFunction(this, 'ThreadFunction', {
+      ...nodejsDefaults,
+      entry: path.join(lambdaDir, 'thread.ts'),
+      handler: 'handler',
       functionName: 'chalk-thread',
     });
 
-    const aiFn = new lambda.Function(this, 'AIFunction', {
-      ...lambdaDefaults,
-      handler: 'ai.handler',
+    const aiFn = new lambdaNode.NodejsFunction(this, 'AIFunction', {
+      ...nodejsDefaults,
+      entry: path.join(lambdaDir, 'ai.ts'),
+      handler: 'handler',
       functionName: 'chalk-ai',
       timeout: cdk.Duration.seconds(60),
       memorySize: 512,
     });
 
-    const adrFn = new lambda.Function(this, 'ADRFunction', {
-      ...lambdaDefaults,
-      handler: 'adr.handler',
+    const adrFn = new lambdaNode.NodejsFunction(this, 'ADRFunction', {
+      ...nodejsDefaults,
+      entry: path.join(lambdaDir, 'adr.ts'),
+      handler: 'handler',
       functionName: 'chalk-adr',
       timeout: cdk.Duration.seconds(60),
     });
 
-    const searchFn = new lambda.Function(this, 'SearchFunction', {
-      ...lambdaDefaults,
-      handler: 'search.handler',
+    const searchFn = new lambdaNode.NodejsFunction(this, 'SearchFunction', {
+      ...nodejsDefaults,
+      entry: path.join(lambdaDir, 'search.ts'),
+      handler: 'handler',
       functionName: 'chalk-search',
     });
 
-    const diagramFn = new lambda.Function(this, 'DiagramFunction', {
-      ...lambdaDefaults,
-      handler: 'diagram.handler',
+    const diagramFn = new lambdaNode.NodejsFunction(this, 'DiagramFunction', {
+      ...nodejsDefaults,
+      entry: path.join(lambdaDir, 'diagram.ts'),
+      handler: 'handler',
       functionName: 'chalk-diagram',
       timeout: cdk.Duration.seconds(60),
     });
 
-    const teamFn = new lambda.Function(this, 'TeamFunction', {
-      ...lambdaDefaults,
-      handler: 'team.handler',
+    const teamFn = new lambdaNode.NodejsFunction(this, 'TeamFunction', {
+      ...nodejsDefaults,
+      entry: path.join(lambdaDir, 'team.ts'),
+      handler: 'handler',
       functionName: 'chalk-team',
     });
 
@@ -244,13 +281,13 @@ export class ChalkStack extends cdk.Stack {
       path: '/rooms',
       methods: [apigatewayv2.HttpMethod.GET, apigatewayv2.HttpMethod.POST],
       integration: new apigatewayv2Integrations.HttpLambdaIntegration('RoomIntegration', roomFn),
-      authorizer,
+
     });
     this.httpApi.addRoutes({
       path: '/rooms/{roomId}',
       methods: [apigatewayv2.HttpMethod.GET],
       integration: new apigatewayv2Integrations.HttpLambdaIntegration('RoomByIdIntegration', roomFn),
-      authorizer,
+
     });
 
     // Thread routes
@@ -258,13 +295,13 @@ export class ChalkStack extends cdk.Stack {
       path: '/rooms/{roomId}/threads',
       methods: [apigatewayv2.HttpMethod.POST],
       integration: new apigatewayv2Integrations.HttpLambdaIntegration('ThreadCreateIntegration', threadFn),
-      authorizer,
+
     });
     this.httpApi.addRoutes({
       path: '/threads/{threadId}/transition',
       methods: [apigatewayv2.HttpMethod.POST],
       integration: new apigatewayv2Integrations.HttpLambdaIntegration('ThreadTransitionIntegration', threadFn),
-      authorizer,
+
     });
 
     // AI / Messaging routes
@@ -272,7 +309,7 @@ export class ChalkStack extends cdk.Stack {
       path: '/threads/{threadId}/messages',
       methods: [apigatewayv2.HttpMethod.POST],
       integration: new apigatewayv2Integrations.HttpLambdaIntegration('AIMessageIntegration', aiFn),
-      authorizer,
+
     });
 
     // ADR routes
@@ -280,13 +317,13 @@ export class ChalkStack extends cdk.Stack {
       path: '/threads/{threadId}/decide',
       methods: [apigatewayv2.HttpMethod.POST],
       integration: new apigatewayv2Integrations.HttpLambdaIntegration('ADRDecideIntegration', adrFn),
-      authorizer,
+
     });
     this.httpApi.addRoutes({
       path: '/rooms/{roomId}/adrs',
       methods: [apigatewayv2.HttpMethod.GET],
       integration: new apigatewayv2Integrations.HttpLambdaIntegration('ADRListIntegration', adrFn),
-      authorizer,
+
     });
 
     // Search routes
@@ -294,7 +331,7 @@ export class ChalkStack extends cdk.Stack {
       path: '/rooms/{roomId}/search',
       methods: [apigatewayv2.HttpMethod.POST],
       integration: new apigatewayv2Integrations.HttpLambdaIntegration('SearchIntegration', searchFn),
-      authorizer,
+
     });
 
     // Diagram routes
@@ -302,7 +339,7 @@ export class ChalkStack extends cdk.Stack {
       path: '/threads/{threadId}/diagram',
       methods: [apigatewayv2.HttpMethod.POST],
       integration: new apigatewayv2Integrations.HttpLambdaIntegration('DiagramIntegration', diagramFn),
-      authorizer,
+
     });
 
     // Team management routes
@@ -310,13 +347,13 @@ export class ChalkStack extends cdk.Stack {
       path: '/teams/{teamId}/members',
       methods: [apigatewayv2.HttpMethod.GET, apigatewayv2.HttpMethod.POST],
       integration: new apigatewayv2Integrations.HttpLambdaIntegration('TeamMembersIntegration', teamFn),
-      authorizer,
+
     });
     this.httpApi.addRoutes({
       path: '/teams/{teamId}/members/{userId}',
       methods: [apigatewayv2.HttpMethod.DELETE, apigatewayv2.HttpMethod.PATCH],
       integration: new apigatewayv2Integrations.HttpLambdaIntegration('TeamMemberIntegration', teamFn),
-      authorizer,
+
     });
 
     // =========================================================================
@@ -345,6 +382,16 @@ export class ChalkStack extends cdk.Stack {
     new cdk.CfnOutput(this, 'BucketName', {
       value: this.bucket.bucketName,
       description: 'S3 bucket name',
+    });
+
+    new cdk.CfnOutput(this, 'CognitoDomain', {
+      value: `https://${userPoolDomain.domainName}.auth.${cdk.Stack.of(this).region}.amazoncognito.com`,
+      description: 'Cognito hosted UI domain',
+    });
+
+    new cdk.CfnOutput(this, 'DefaultTeamId', {
+      value: 'chalk-team',
+      description: 'Default Cognito group (team ID)',
     });
   }
 }

@@ -29,7 +29,7 @@ export type AIError =
 const complexitySchema = z.enum(['Low', 'Medium', 'High']);
 
 const optionSchema = z.object({
-  summary: z.string().max(200).min(1),
+  summary: z.string().max(500).min(1),
   benefits: z.array(z.string().min(1)).min(2),
   risks: z.array(z.string().min(1)).min(2),
   complexity: complexitySchema,

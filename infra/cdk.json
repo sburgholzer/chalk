@@ -1,0 +1,7 @@
+{
+  "app": "npx ts-node --prefer-ts-exts lib/chalk-stack-app.ts",
+  "watch": {
+    "include": ["**"],
+    "exclude": ["node_modules", "cdk.out"]
+  }
+}

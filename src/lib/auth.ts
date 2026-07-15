@@ -141,10 +141,14 @@ function getRedirectUri(): string {
   return process.env.NEXT_PUBLIC_REDIRECT_URI ?? `${window.location.origin}/login`;
 }
 
+function getCallbackUri(): string {
+  return `${window.location.origin}/api/auth/callback`;
+}
+
 export function getLoginUrl(): string {
   const domain = getCognitoDomain();
   const clientId = getCognitoClientId();
-  const redirectUri = encodeURIComponent(getRedirectUri());
+  const redirectUri = encodeURIComponent(getCallbackUri());
   return `${domain}/login?client_id=${clientId}&response_type=code&scope=openid+email+profile&redirect_uri=${redirectUri}`;
 }
 
@@ -237,15 +241,10 @@ export async function refreshAccessToken(): Promise<string | null> {
  * On 503 responses, throws with a persistence error flag for retry banner display.
  */
 export async function authFetcher<T>(url: string): Promise<T> {
-  let token = getAccessToken();
+  const token = getAccessToken();
 
-  if (!token || isTokenExpired(token)) {
-    const refreshed = await refreshAccessToken();
-    if (!refreshed) {
-      window.location.href = '/login';
-      throw new Error('Authentication required');
-    }
-    token = refreshed;
+  if (!token) {
+    throw new Error('Authentication required');
   }
 
   const response = await fetch(url, {
@@ -257,8 +256,7 @@ export async function authFetcher<T>(url: string): Promise<T> {
 
   if (response.status === 401) {
     clearTokens();
-    window.location.href = '/login';
-    throw new Error('Authentication required');
+    throw new Error('Session expired. Please sign in again.');
   }
 
   if (response.status === 503) {

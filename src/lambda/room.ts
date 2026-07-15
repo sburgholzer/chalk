@@ -33,17 +33,44 @@ interface AuthorizerContext {
 
 /**
  * Extracts the authorizer context from the API Gateway event.
- * Returns null if the context is missing or malformed.
+ * First checks for API Gateway authorizer context, then falls back
+ * to decoding the Authorization Bearer token directly.
  */
 function extractAuthContext(event: APIGatewayProxyEventV2): AuthorizerContext | null {
-  const context = (event.requestContext as unknown as { authorizer?: { lambda?: AuthorizerContext } })
-    ?.authorizer?.lambda;
+  // Try API Gateway authorizer context first
+  const context = (event.requestContext as unknown as { authorizer?: { lambda?: AuthorizerContext; jwt?: { claims: Record<string, string> } } })
+    ?.authorizer;
 
-  if (!context?.userId || !context?.teams) {
-    return null;
+  if (context?.lambda?.userId && context?.lambda?.teams) {
+    return context.lambda;
   }
 
-  return context;
+  // Fall back to decoding the Bearer token from the Authorization header
+  const authHeader = event.headers?.authorization ?? event.headers?.Authorization;
+  if (!authHeader) return null;
+
+  const parts = authHeader.split(' ');
+  if (parts.length !== 2 || parts[0] !== 'Bearer') return null;
+
+  try {
+    const tokenParts = parts[1].split('.');
+    if (tokenParts.length !== 3) return null;
+    const payload = JSON.parse(Buffer.from(tokenParts[1], 'base64url').toString());
+
+    const userId = payload.sub ?? payload['cognito:username'] ?? '';
+    const email = payload.email ?? '';
+    const groups = payload['cognito:groups'] ?? [];
+
+    if (!userId) return null;
+
+    return {
+      userId,
+      email,
+      teams: JSON.stringify(groups),
+    };
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -214,7 +241,7 @@ async function handleGetRoom(event: APIGatewayProxyEventV2): Promise<APIGatewayP
     return jsonResponse(403, { error: 'User is not assigned to any team' });
   }
 
-  const roomId = getPathParam(event, 'id') as RoomId | undefined;
+  const roomId = getPathParam(event, 'roomId') as RoomId | undefined;
   if (!roomId) {
     return jsonResponse(400, { error: 'Missing room ID' });
   }

@@ -8,16 +8,25 @@
  * Requirements: 10.1, 10.6
  */
 
-import { useEffect } from 'react';
+import { useEffect, useState } from 'react';
 import { useAuth } from '@/components/AuthProvider';
 
 export function LoginPage() {
   const { isAuthenticated, isLoading, login } = useAuth();
+  const [authError, setAuthError] = useState<string | null>(null);
 
-  // Redirect authenticated users to the rooms page
+  // Check for auth errors and redirect authenticated users
   useEffect(() => {
     if (!isLoading && isAuthenticated) {
       window.location.href = '/rooms';
+    }
+    // Check if there was an auth error stored
+    if (typeof window !== 'undefined') {
+      const err = (window as unknown as Record<string, string>).__authError;
+      if (err) {
+        setAuthError(err);
+        delete (window as unknown as Record<string, string>).__authError;
+      }
     }
   }, [isAuthenticated, isLoading]);
 
@@ -49,8 +58,14 @@ export function LoginPage() {
             onClick={login}
             className="mt-6 w-full rounded-md bg-indigo-600 px-4 py-2.5 text-sm font-medium text-white hover:bg-indigo-700 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:ring-offset-2 transition-colors"
           >
-            Sign in with SSO
+            Sign In
           </button>
+
+          {authError && (
+            <div className="mt-4 rounded-md border border-red-200 bg-red-50 p-3">
+              <p className="text-sm text-red-700">{authError}</p>
+            </div>
+          )}
 
           <div className="mt-6 border-t border-gray-200 pt-4">
             <p className="text-center text-xs text-gray-500">

@@ -1,46 +1,52 @@
 'use client';
 
+import { useState } from 'react';
 import { useParams } from 'next/navigation';
-import useSWR from 'swr';
+import useSWR, { mutate } from 'swr';
 import { Room, DecisionThread } from '@/types/domain';
 import { ThreadList } from '@/components/ThreadList';
+import { authFetcher, authRequest } from '@/lib/auth';
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL ?? '';
-
-async function fetchRoom(url: string): Promise<Room> {
-  const res = await fetch(url);
-  if (!res.ok) {
-    throw new Error('Failed to fetch room');
-  }
-  return res.json();
-}
-
-async function fetchThreads(url: string): Promise<DecisionThread[]> {
-  const res = await fetch(url);
-  if (!res.ok) {
-    throw new Error('Failed to fetch threads');
-  }
-  return res.json();
-}
 
 export function RoomDetailPage() {
   const params = useParams<{ id: string }>();
   const roomId = params.id;
+  const [threadTitle, setThreadTitle] = useState('');
+  const [isCreating, setIsCreating] = useState(false);
+  const [createError, setCreateError] = useState<string | null>(null);
 
   const {
-    data: room,
+    data,
     error: roomError,
     isLoading: roomLoading,
-  } = useSWR<Room>(`${API_URL}/rooms/${roomId}`, fetchRoom);
-
-  const {
-    data: threads,
-    error: threadsError,
-    isLoading: threadsLoading,
-  } = useSWR<DecisionThread[]>(
-    `${API_URL}/rooms/${roomId}/threads`,
-    fetchThreads
+  } = useSWR<{ room: Room; threads: DecisionThread[] }>(
+    `${API_URL}/rooms/${roomId}`,
+    authFetcher
   );
+
+  const room = data?.room;
+  const threads = data?.threads ?? [];
+
+  async function handleCreateThread(e: React.FormEvent) {
+    e.preventDefault();
+    if (!threadTitle.trim()) return;
+
+    setIsCreating(true);
+    setCreateError(null);
+    try {
+      await authRequest(`${API_URL}/rooms/${roomId}/threads`, {
+        method: 'POST',
+        body: JSON.stringify({ title: threadTitle.trim() }),
+      });
+      setThreadTitle('');
+      mutate(`${API_URL}/rooms/${roomId}`);
+    } catch (err) {
+      setCreateError(err instanceof Error ? err.message : 'Failed to create thread');
+    } finally {
+      setIsCreating(false);
+    }
+  }
 
   if (roomLoading) {
     return (
@@ -80,13 +86,39 @@ export function RoomDetailPage() {
 
       <section className="mt-8">
         <h2 className="text-lg font-semibold text-gray-800">
+          Start a Decision Thread
+        </h2>
+        <form onSubmit={handleCreateThread} className="mt-3 flex gap-2">
+          <input
+            type="text"
+            value={threadTitle}
+            onChange={(e) => setThreadTitle(e.target.value)}
+            placeholder="e.g., Choose a database strategy"
+            disabled={isCreating}
+            className="flex-1 rounded-md border border-gray-300 px-3 py-2 text-sm focus:border-blue-500 focus:outline-none focus:ring-1 focus:ring-blue-500 disabled:bg-gray-100"
+          />
+          <button
+            type="submit"
+            disabled={isCreating || !threadTitle.trim()}
+            className="rounded-md bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed"
+          >
+            {isCreating ? 'Creating...' : 'Start Thread'}
+          </button>
+        </form>
+        {createError && (
+          <p className="mt-2 text-sm text-red-600">{createError}</p>
+        )}
+      </section>
+
+      <section className="mt-8">
+        <h2 className="text-lg font-semibold text-gray-800">
           Decision Threads
         </h2>
         <div className="mt-3">
           <ThreadList
-            threads={threads ?? []}
-            isLoading={threadsLoading}
-            error={threadsError?.message}
+            threads={threads}
+            isLoading={roomLoading}
+            error={roomError?.message}
           />
         </div>
       </section>

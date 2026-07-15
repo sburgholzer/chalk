@@ -77,8 +77,59 @@ export function AuthProvider({ children }: AuthProviderProps) {
   // Initialize auth state from stored tokens
   useEffect(() => {
     async function initAuth() {
-      // Check for OAuth callback code in URL
+      // Check for tokens in query params (from server-side callback)
       const params = new URLSearchParams(window.location.search);
+      const accessTokenParam = params.get('access_token');
+
+      if (accessTokenParam) {
+        setAccessToken(accessTokenParam);
+        const refreshTokenParam = params.get('refresh_token');
+        if (refreshTokenParam) setRefreshToken(refreshTokenParam);
+        const userFromToken = extractUserFromToken(accessTokenParam);
+        if (userFromToken) {
+          setUserInfo(userFromToken);
+          setUser(userFromToken);
+        }
+        // Clean the URL
+        window.history.replaceState({}, '', window.location.pathname);
+        setIsLoading(false);
+        return;
+      }
+
+      // Check for error in URL hash (Cognito returns errors this way)
+      const hash = window.location.hash;
+      if (hash && hash.includes('error')) {
+        const hashParams = new URLSearchParams(hash.substring(1));
+        const error = hashParams.get('error');
+        const errorDescription = hashParams.get('error_description');
+        console.error('Cognito auth error:', error, errorDescription);
+        if (typeof window !== 'undefined') {
+          (window as unknown as Record<string, string>).__authError = `${error}: ${errorDescription}`;
+        }
+        window.history.replaceState({}, '', window.location.pathname);
+        setIsLoading(false);
+        return;
+      }
+
+      // Check for implicit flow tokens in URL hash fragment
+      if (hash && hash.includes('access_token')) {
+        const hashParams = new URLSearchParams(hash.substring(1));
+        const accessToken = hashParams.get('access_token');
+
+        if (accessToken) {
+          setAccessToken(accessToken);
+          const userFromToken = extractUserFromToken(accessToken);
+          if (userFromToken) {
+            setUserInfo(userFromToken);
+            setUser(userFromToken);
+          }
+        }
+        window.history.replaceState({}, '', window.location.pathname);
+        setIsLoading(false);
+        return;
+      }
+
+      // Check for OAuth callback code in URL (authorization code flow fallback)
       const code = params.get('code');
 
       if (code) {
@@ -139,7 +190,7 @@ export function AuthProvider({ children }: AuthProviderProps) {
     const domain = process.env.NEXT_PUBLIC_COGNITO_DOMAIN ?? '';
     const clientId = process.env.NEXT_PUBLIC_COGNITO_CLIENT_ID ?? '';
     const redirectUri = encodeURIComponent(
-      process.env.NEXT_PUBLIC_REDIRECT_URI ?? `${window.location.origin}/login`
+      `${window.location.origin}/api/auth/callback`
     );
     window.location.href =
       `${domain}/login?client_id=${clientId}&response_type=code&scope=openid+email+profile&redirect_uri=${redirectUri}`;

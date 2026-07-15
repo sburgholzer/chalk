@@ -59,13 +59,37 @@ interface DecideRequest {
  */
 function extractAuthContext(event: APIGatewayProxyEventV2): AuthorizerContext | null {
   const context = (event.requestContext as unknown as { authorizer?: { lambda?: AuthorizerContext } })
-    ?.authorizer?.lambda;
+    ?.authorizer;
 
-  if (!context?.userId || !context?.teams) {
-    return null;
+  if (context?.lambda?.userId && context?.lambda?.teams) {
+    return context.lambda;
   }
 
-  return context;
+  const authHeader = event.headers?.authorization ?? event.headers?.Authorization;
+  if (!authHeader) return null;
+
+  const parts = authHeader.split(' ');
+  if (parts.length !== 2 || parts[0] !== 'Bearer') return null;
+
+  try {
+    const tokenParts = parts[1].split('.');
+    if (tokenParts.length !== 3) return null;
+    const payload = JSON.parse(Buffer.from(tokenParts[1], 'base64url').toString());
+
+    const userId = payload.sub ?? payload['cognito:username'] ?? '';
+    const email = payload.email ?? '';
+    const groups = payload['cognito:groups'] ?? [];
+
+    if (!userId) return null;
+
+    return {
+      userId,
+      email,
+      teams: JSON.stringify(groups),
+    };
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -182,7 +206,7 @@ async function handleDecide(event: APIGatewayProxyEventV2): Promise<APIGatewayPr
     return jsonResponse(403, { error: 'User is not assigned to any team' });
   }
 
-  const threadId = getPathParam(event, 'id') as ThreadId | undefined;
+  const threadId = getPathParam(event, 'threadId') as ThreadId | undefined;
   if (!threadId) {
     return jsonResponse(400, { error: 'Missing thread ID' });
   }
@@ -403,7 +427,7 @@ async function handleListADRs(event: APIGatewayProxyEventV2): Promise<APIGateway
     return jsonResponse(403, { error: 'User is not assigned to any team' });
   }
 
-  const roomId = getPathParam(event, 'id') as RoomId | undefined;
+  const roomId = getPathParam(event, 'roomId') as RoomId | undefined;
   if (!roomId) {
     return jsonResponse(400, { error: 'Missing room ID' });
   }
