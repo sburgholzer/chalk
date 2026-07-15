@@ -2,341 +2,577 @@
 
 ## Overview
 
-Chalk is a full-stack application providing a persistent workspace where teams collaborate with an AI Architect agent to deliberate and document architecture decisions. The system manages project-level Rooms containing Decision Threads that flow through a defined lifecycle (DRAFT → IN_PROGRESS → DECIDED → SUPERSEDED), with AI-powered option analysis, tradeoff comparison, ADR generation, diagram creation, and cross-referencing of prior decisions.
+Chalk is a serverless Architecture Decision Room that combines conversational AI with structured decision-making to produce Architecture Decision Records. The system is organized as a Next.js 14 application backed by AWS Lambda functions, DynamoDB for persistence, Amazon Bedrock for AI reasoning and embeddings, and S3 for artifact storage.
 
-The design prioritizes:
-- **Structured deliberation**: A clear state machine governs thread lifecycle transitions
-- **Persistent context**: All conversations, decisions, and artifacts survive across sessions
-- **AI-augmented analysis**: The AI Architect proposes options, generates tradeoff tables, produces ADRs, and creates .drawio diagrams
-- **Decision traceability**: Cross-references and a searchable journal connect decisions over time
+The core workflow is:
+1. A user creates a **Room** (project workspace) and starts a **Decision Thread**
+2. The **AI Architect** (powered by Bedrock/Claude) analyzes constraints, asks clarifying questions, proposes options with tradeoff tables
+3. On approval, the thread transitions to DECIDED and an **ADR** is generated
+4. All decisions are cross-referenced and semantically searchable via Titan Embeddings
+
+Key architectural choices:
+- **DynamoDB single-table design** — Rooms, threads, messages, ADRs, and cross-references share one table with carefully designed partition/sort keys and GSIs
+- **Thread state machine** — Enforces valid lifecycle transitions (DRAFT → IN_PROGRESS → DECIDED → SUPERSEDED)
+- **Result<T, E> pattern** — Domain logic never throws; all fallible operations return typed results
+- **Write-before-acknowledge** — Messages are persisted to DynamoDB before the client receives confirmation
+- **Embedding-augmented search** — Titan Embeddings stored as DynamoDB attributes enable cosine similarity without a separate vector database
 
 ## Architecture
 
-The system follows a layered architecture with clear separation between the API layer, domain logic, AI integration, persistence, and search.
+### High-Level System Diagram
 
 ```mermaid
 graph TB
-    subgraph Client
-        UI[Web Client]
+    subgraph "Frontend (AWS Amplify)"
+        UI[Next.js 14 App Router]
+        RC[React Components]
+        SWR[SWR Cache Layer]
     end
 
-    subgraph API Layer
-        REST[REST API / WebSocket]
+    subgraph "Auth (Amazon Cognito)"
+        UP[User Pool]
+        IG[Identity Groups / Teams]
     end
 
-    subgraph Domain Layer
+    subgraph "API Layer"
+        AG[API Gateway HTTP API]
+        AUTH[Cognito Authorizer]
+    end
+
+    subgraph "Compute (AWS Lambda)"
         RM[Room Manager]
-        TLC[Thread Lifecycle Controller]
-        ADRG[ADR Generator]
-        XRef[Cross-Reference Engine]
+        TL[Thread Lifecycle]
+        AI[AI Architect]
+        ADR[ADR Generator]
+        CR[Cross-Reference Engine]
         DJ[Decision Journal / Search]
-    end
-
-    subgraph AI Layer
-        AIA[AI Architect Service]
         DG[Diagram Generator]
     end
 
-    subgraph Persistence Layer
-        DB[(Database)]
-        FS[File Storage - Diagrams]
+    subgraph "AI (Amazon Bedrock)"
+        Claude[Claude - Reasoning]
+        Titan[Titan Embeddings]
     end
 
-    UI --> REST
-    REST --> RM
-    REST --> TLC
-    REST --> DJ
-    RM --> DB
-    TLC --> AIA
-    TLC --> ADRG
-    TLC --> XRef
-    ADRG --> AIA
-    AIA --> DB
-    DG --> FS
-    XRef --> DB
-    DJ --> DB
-    TLC --> DB
+    subgraph "Storage"
+        DDB[(DynamoDB Single Table)]
+        S3[(S3 Bucket)]
+    end
+
+    UI --> AG
+    AG --> AUTH
+    AUTH --> UP
+    AG --> RM
+    AG --> TL
+    AG --> AI
+    AG --> ADR
+    AG --> CR
+    AG --> DJ
+    AG --> DG
+    RM --> DDB
+    TL --> DDB
+    AI --> Claude
+    AI --> DDB
+    ADR --> DDB
+    ADR --> S3
+    CR --> DDB
+    DJ --> Titan
+    DJ --> DDB
+    DG --> Claude
+    DG --> S3
+    SWR --> AG
+    RC --> SWR
 ```
 
-**Key Architectural Decisions:**
+### Request Flow
 
-1. **State machine for thread lifecycle**: Transitions are validated by a deterministic state machine, preventing invalid states and making the lifecycle testable independently of I/O.
-2. **Event-driven AI interactions**: AI responses are triggered by domain events (message sent, decision made, thread opened) rather than tightly coupling AI logic to controllers.
-3. **Separation of search from persistence**: Full-text search uses an index that can be rebuilt from the source-of-truth persistence layer.
-4. **File-based diagram storage**: .drawio XML files are stored on the filesystem alongside the room data, referenced by relative path in ADRs.
+```mermaid
+sequenceDiagram
+    participant U as User (Browser)
+    participant AG as API Gateway
+    participant Auth as Cognito Authorizer
+    participant Lambda as Lambda Function
+    participant DDB as DynamoDB
+    participant Bedrock as Amazon Bedrock
+
+    U->>AG: POST /threads/:id/messages
+    AG->>Auth: Validate JWT
+    Auth-->>AG: Token valid + team claims
+    AG->>Lambda: Invoke with event
+    Lambda->>DDB: PutItem (persist message)
+    DDB-->>Lambda: Write confirmed
+    Lambda->>Bedrock: InvokeModel (Claude)
+    Bedrock-->>Lambda: AI response
+    Lambda->>DDB: PutItem (persist AI response)
+    DDB-->>Lambda: Write confirmed
+    Lambda-->>AG: 200 + messages
+    AG-->>U: Response with AI message
+```
+
+### Thread State Machine
+
+```mermaid
+stateDiagram-v2
+    [*] --> DRAFT: createThread()
+    DRAFT --> IN_PROGRESS: sendMessage()
+    IN_PROGRESS --> IN_PROGRESS: sendMessage() / addConstraint()
+    IN_PROGRESS --> DECIDED: approveOption()
+    DECIDED --> IN_PROGRESS: reopenThread()
+    DECIDED --> SUPERSEDED: supersedeThread(newThreadId)
+    SUPERSEDED --> [*]
+```
 
 ## Components and Interfaces
 
-### Room Manager
+### Domain Layer (`src/lib/`)
 
-Responsible for CRUD operations on Rooms and enforcing naming constraints.
+#### Room Manager (`room-manager.ts`)
+
+Handles creation, retrieval, and validation of Rooms.
 
 ```typescript
-interface RoomManager {
-  createRoom(name: string): Result<Room, RoomCreationError>;
-  getRoom(roomId: string): Result<Room, NotFoundError>;
-  listRooms(): Room[];
-}
+import { Result } from '@/types/result';
+import { Room, RoomId, TeamId } from '@/types/domain';
 
-type RoomCreationError =
-  | { type: "empty_name" }
-  | { type: "name_too_long"; maxLength: 100 }
-  | { type: "duplicate_name"; existingRoomId: string };
+export type RoomError =
+  | { kind: 'EMPTY_NAME' }
+  | { kind: 'NAME_TOO_LONG'; maxLength: number }
+  | { kind: 'DUPLICATE_NAME'; existingId: RoomId }
+  | { kind: 'NOT_FOUND'; roomId: RoomId }
+  | { kind: 'PERSISTENCE_FAILURE'; cause: string };
+
+export function validateRoomName(name: string): Result<string, RoomError>;
+
+export function createRoom(params: {
+  name: string;
+  teamId: TeamId;
+  createdBy: string;
+}): Result<Room, RoomError>;
+
+export function getRoom(roomId: RoomId, teamId: TeamId): Promise<Result<Room, RoomError>>;
+
+export function listRoomsForTeam(teamId: TeamId): Promise<Result<Room[], RoomError>>;
 ```
 
-### Thread Lifecycle Controller
+#### Thread Lifecycle (`thread-lifecycle.ts`)
 
-Manages Decision Thread state transitions via a finite state machine.
+Enforces the thread state machine. All status transitions go through this module.
 
 ```typescript
-interface ThreadLifecycleController {
-  createThread(roomId: string, topic: string): Result<DecisionThread, Error>;
-  sendMessage(threadId: string, content: string): Result<Message, PersistenceError>;
-  approveOption(threadId: string, optionId: string): Result<DecisionThread, TransitionError>;
-  reopenThread(threadId: string): Result<DecisionThread, TransitionError>;
-  supersedeThread(threadId: string, replacingThreadId: string): Result<DecisionThread, TransitionError>;
-}
+import { Result } from '@/types/result';
+import { DecisionThread, ThreadId, RoomId, ThreadStatus, Option } from '@/types/domain';
 
-type TransitionError = {
-  type: "invalid_transition";
-  currentStatus: ThreadStatus;
-  attemptedStatus: ThreadStatus;
-  validTransitions: ThreadStatus[];
+export type ThreadError =
+  | { kind: 'INVALID_TRANSITION'; from: ThreadStatus; to: ThreadStatus; validTargets: ThreadStatus[] }
+  | { kind: 'NOT_FOUND'; threadId: ThreadId }
+  | { kind: 'PERSISTENCE_FAILURE'; cause: string };
+
+// Valid transitions encoded as a map
+export const VALID_TRANSITIONS: Record<ThreadStatus, ThreadStatus[]> = {
+  DRAFT: ['IN_PROGRESS'],
+  IN_PROGRESS: ['DECIDED'],
+  DECIDED: ['IN_PROGRESS', 'SUPERSEDED'],
+  SUPERSEDED: [],
 };
+
+export function createThread(params: {
+  roomId: RoomId;
+  title: string;
+  createdBy: string;
+}): Result<DecisionThread, ThreadError>;
+
+export function transition(
+  thread: DecisionThread,
+  targetStatus: ThreadStatus,
+  metadata?: { selectedOption?: Option; supersededBy?: ThreadId; reopenReason?: string }
+): Result<DecisionThread, ThreadError>;
+
+export function canTransition(from: ThreadStatus, to: ThreadStatus): boolean;
 ```
 
-### AI Architect Service
+#### AI Architect (`ai-architect.ts`)
 
-Handles all AI-powered analysis including option proposals, clarifying questions, and tradeoff generation.
+Orchestrates Bedrock Claude interactions for option proposals, clarifying questions, and tradeoff tables.
 
 ```typescript
-interface AIArchitectService {
-  proposeOptions(thread: DecisionThread): Promise<OptionProposal>;
-  askClarifyingQuestions(thread: DecisionThread): Promise<ClarifyingQuestions | null>;
-  regenerateAnalysis(thread: DecisionThread, newConstraints: string): Promise<OptionProposal>;
-  respondToObjection(thread: DecisionThread, objection: string): Promise<RevisedProposal>;
-}
+import { Result } from '@/types/result';
+import { Message, OptionProposal, TradeoffTable, ClarifyingQuestion } from '@/types/domain';
 
-interface OptionProposal {
-  options: ArchitectureOption[];  // 2-5 options
-  tradeoffTable: TradeoffTable;
-  assumptions?: string[];         // stated when info is missing
-}
+export type AIError =
+  | { kind: 'BEDROCK_INVOCATION_FAILURE'; cause: string }
+  | { kind: 'RESPONSE_VALIDATION_FAILURE'; rawResponse: string }
+  | { kind: 'INSUFFICIENT_CONTEXT'; missing: string[] }
+  | { kind: 'RATE_LIMITED'; retryAfterMs: number };
 
-interface ArchitectureOption {
-  id: string;
-  summary: string;               // max 200 chars
-  benefits: string[];            // min 2
-  risks: string[];               // min 2
-  complexity: "Low" | "Medium" | "High";
-}
+export function assessInputSufficiency(
+  messages: Message[],
+  priorADRs: { id: string; title: string; context: string }[]
+): Promise<Result<
+  | { sufficient: true }
+  | { sufficient: false; questions: ClarifyingQuestion[] },
+  AIError
+>>;
+
+export function proposeOptions(params: {
+  messages: Message[];
+  constraints: string[];
+  priorDecisions: { id: string; title: string; relevance: string }[];
+}): Promise<Result<OptionProposal, AIError>>;
+
+export function regenerateTradeoffTable(params: {
+  previousTable: TradeoffTable;
+  newConstraints: string[];
+  messages: Message[];
+}): Promise<Result<{ table: TradeoffTable; changes: string[] }, AIError>>;
 ```
 
-### ADR Generator
+#### ADR Generator (`adr-generator.ts`)
 
 Produces structured ADR documents from decided threads.
 
 ```typescript
-interface ADRGenerator {
-  generateADR(thread: DecisionThread): Promise<Result<ADR, ADRGenerationError>>;
-  updateADRStatus(adrId: string, status: ADRStatus, supersededBy?: string): Result<ADR, Error>;
-}
+import { Result } from '@/types/result';
+import { ADR, DecisionThread, CrossReference } from '@/types/domain';
 
-type ADRGenerationError =
-  | { type: "insufficient_context"; missingSections: string[] }
-  | { type: "system_error"; message: string; retriesRemaining: number };
+export type ADRError =
+  | { kind: 'INSUFFICIENT_CONTEXT'; missingSections: string[] }
+  | { kind: 'GENERATION_FAILURE'; cause: string; attempt: number }
+  | { kind: 'S3_UPLOAD_FAILURE'; cause: string };
+
+export function generateADR(params: {
+  thread: DecisionThread;
+  selectedOption: string;
+  crossReferences: CrossReference[];
+  nextSequentialId: number;
+}): Promise<Result<ADR, ADRError>>;
+
+export function exportADRToS3(adr: ADR): Promise<Result<{ s3Key: string }, ADRError>>;
 ```
 
-### Cross-Reference Engine
+#### Cross-Reference Engine (`cross-reference.ts`)
 
-Discovers and manages relationships between decisions.
+Manages relationships between threads/ADRs and traverses the decision graph.
 
 ```typescript
-interface CrossReferenceEngine {
-  findRelatedDecisions(thread: DecisionThread, allThreads: DecisionThread[]): RelatedDecision[];
-  detectContradictions(option: ArchitectureOption, existingADRs: ADR[]): Contradiction[];
-  detectDependencies(option: ArchitectureOption, existingADRs: ADR[]): Dependency[];
-  summarizeChangesSince(date: Date, room: Room): RoomChangeSummary;
-}
+import { Result } from '@/types/result';
+import { CrossReference, ThreadId, RoomId } from '@/types/domain';
+
+export type CrossRefError =
+  | { kind: 'SELF_REFERENCE' }
+  | { kind: 'TARGET_NOT_FOUND'; targetId: ThreadId }
+  | { kind: 'PERSISTENCE_FAILURE'; cause: string };
+
+export type ReferenceType = 'SUPERSEDES' | 'DEPENDS_ON' | 'CONTRADICTS' | 'RELATED_TO';
+
+export function createCrossReference(params: {
+  sourceThreadId: ThreadId;
+  targetThreadId: ThreadId;
+  referenceType: ReferenceType;
+  description: string;
+}): Result<CrossReference, CrossRefError>;
+
+export function findRelatedDecisions(params: {
+  roomId: RoomId;
+  currentThreadId: ThreadId;
+  threadContent: string;
+  existingADRs: { id: string; title: string; context: string; embedding: number[] }[];
+  queryEmbedding: number[];
+  similarityThreshold?: number;
+}): Result<{ id: string; title: string; relevance: string; score: number }[], CrossRefError>;
+
+export function getReferencesForThread(
+  threadId: ThreadId
+): Promise<Result<CrossReference[], CrossRefError>>;
 ```
 
-### Decision Journal (Search)
+#### Decision Journal (`decision-journal.ts`)
 
-Provides full-text and structured search across the decision history.
+Handles semantic search and structured filtering of the decision history.
 
 ```typescript
-interface DecisionJournal {
-  search(query: SearchQuery): Result<SearchResults, SearchError>;
-}
+import { Result } from '@/types/result';
+import { SearchResult, ThreadStatus } from '@/types/domain';
 
-interface SearchQuery {
-  text: string;               // must be non-empty, non-whitespace
+export type SearchError =
+  | { kind: 'EMPTY_QUERY' }
+  | { kind: 'EMBEDDING_FAILURE'; cause: string }
+  | { kind: 'QUERY_FAILURE'; cause: string };
+
+export function semanticSearch(params: {
+  roomId: string;
+  query: string;
   filters?: {
     status?: ThreadStatus;
-    dateFrom?: Date;
-    dateTo?: Date;
+    dateRange?: { from: Date; to: Date };
+    title?: string;
   };
-  limit?: number;             // max 50
-}
+  limit?: number;
+  minSimilarity?: number;
+}): Promise<Result<SearchResult[], SearchError>>;
 
-interface SearchResults {
-  matches: SearchMatch[];     // ranked by relevance
-  totalCount: number;
-}
+export function generateEmbedding(text: string): Promise<Result<number[], SearchError>>;
 
-interface SearchMatch {
-  threadId: string;
-  title: string;
-  status: ThreadStatus;
-  date: Date;
-  summary: string;            // max 200 chars
-}
+export function cosineSimilarity(a: number[], b: number[]): number;
 ```
 
-### Diagram Generator
+### Service Layer (`src/services/`)
 
-Creates .drawio XML files for infrastructure architecture decisions.
+#### Bedrock Service (`bedrock.ts`)
 
 ```typescript
-interface DiagramGenerator {
-  generateDiagram(thread: DecisionThread): Promise<Result<DiagramFile, DiagramError>>;
-  generateOptionComparison(options: ArchitectureOption[]): Promise<Result<DiagramFile, DiagramError>>;
+import { Result } from '@/types/result';
+
+export type BedrockError =
+  | { kind: 'INVOCATION_FAILURE'; statusCode: number; message: string }
+  | { kind: 'THROTTLED'; retryAfterMs: number }
+  | { kind: 'VALIDATION_ERROR'; message: string };
+
+export function invokeClaudeModel(params: {
+  systemPrompt: string;
+  messages: { role: 'user' | 'assistant'; content: string }[];
+  maxTokens?: number;
+  temperature?: number;
+}): Promise<Result<string, BedrockError>>;
+
+export function generateTitanEmbedding(
+  text: string
+): Promise<Result<number[], BedrockError>>;
+```
+
+#### DynamoDB Service (`dynamo.ts`)
+
+```typescript
+import { Result } from '@/types/result';
+
+export type DynamoError =
+  | { kind: 'WRITE_FAILURE'; cause: string }
+  | { kind: 'READ_FAILURE'; cause: string }
+  | { kind: 'CONDITION_CHECK_FAILED'; message: string }
+  | { kind: 'RETRIES_EXHAUSTED'; attempts: number; lastError: string };
+
+export function putItem<T>(params: {
+  item: T;
+  conditionExpression?: string;
+}): Promise<Result<T, DynamoError>>;
+
+export function getItem<T>(params: {
+  pk: string;
+  sk: string;
+}): Promise<Result<T | null, DynamoError>>;
+
+export function query<T>(params: {
+  pk: string;
+  skPrefix?: string;
+  indexName?: string;
+  limit?: number;
+  filterExpression?: string;
+}): Promise<Result<T[], DynamoError>>;
+
+export function putItemWithRetry<T>(
+  item: T,
+  maxRetries?: number,
+  baseDelayMs?: number
+): Promise<Result<T, DynamoError>>;
+```
+
+#### S3 Service (`s3.ts`)
+
+```typescript
+import { Result } from '@/types/result';
+
+export type S3Error =
+  | { kind: 'UPLOAD_FAILURE'; cause: string }
+  | { kind: 'DOWNLOAD_FAILURE'; cause: string }
+  | { kind: 'NOT_FOUND'; key: string };
+
+export function uploadDocument(params: {
+  key: string;
+  body: string | Buffer;
+  contentType: string;
+}): Promise<Result<{ key: string; url: string }, S3Error>>;
+
+export function getDocument(key: string): Promise<Result<{ body: string; contentType: string }, S3Error>>;
+```
+
+### Types (`src/types/`)
+
+#### Result Type (`result.ts`)
+
+```typescript
+export type Result<T, E> =
+  | { ok: true; value: T }
+  | { ok: false; error: E };
+
+export function ok<T>(value: T): Result<T, never> {
+  return { ok: true, value };
 }
 
-interface DiagramFile {
-  fileName: string;
-  relativePath: string;
-  content: string;            // .drawio XML
+export function err<E>(error: E): Result<never, E> {
+  return { ok: false, error };
+}
+
+export function isOk<T, E>(result: Result<T, E>): result is { ok: true; value: T } {
+  return result.ok;
+}
+
+export function isErr<T, E>(result: Result<T, E>): result is { ok: false; error: E } {
+  return !result.ok;
+}
+
+export function map<T, U, E>(result: Result<T, E>, fn: (value: T) => U): Result<U, E> {
+  return result.ok ? ok(fn(result.value)) : result;
+}
+
+export function flatMap<T, U, E>(result: Result<T, E>, fn: (value: T) => Result<U, E>): Result<U, E> {
+  return result.ok ? fn(result.value) : result;
 }
 ```
 
 ## Data Models
 
-### Room
+### DynamoDB Single-Table Design
+
+All entities share a single DynamoDB table (`ChalkTable`) with the following access patterns driven by partition key (PK) and sort key (SK) design:
+
+#### Key Schema
+
+| Entity | PK | SK | Purpose |
+|--------|----|----|---------|
+| Room | `TEAM#{teamId}` | `ROOM#{roomId}` | List rooms by team |
+| Thread | `ROOM#{roomId}` | `THREAD#{threadId}` | List threads in room |
+| Message | `THREAD#{threadId}` | `MSG#{timestamp}#{messageId}` | Messages in order |
+| ADR | `ROOM#{roomId}` | `ADR#{adrId}` | List ADRs in room |
+| CrossRef | `THREAD#{threadId}` | `XREF#{targetThreadId}` | References from thread |
+| Embedding | `ROOM#{roomId}` | `EMB#{entityType}#{entityId}` | Embeddings by room |
+| User | `USER#{userId}` | `PROFILE` | User profile |
+| TeamMember | `TEAM#{teamId}` | `MEMBER#{userId}` | Team membership |
+
+#### Global Secondary Indexes (GSIs)
+
+| GSI Name | PK | SK | Use Case |
+|----------|----|----|----------|
+| GSI1 (StatusIndex) | `ROOM#{roomId}` | `STATUS#{status}#DATE#{isoDate}` | Filter threads by status + date |
+| GSI2 (UserIndex) | `USER#{userId}` | `ROOM#{roomId}` | List rooms a user belongs to |
+| GSI3 (ADRIndex) | `ROOM#{roomId}` | `ADR_SEQ#{sequentialId}` | Get next ADR sequential ID |
+
+#### Entity Schemas
 
 ```typescript
-interface Room {
-  id: string;                          // unique identifier (UUID)
-  name: string;                        // 1-100 characters
-  createdAt: Date;
-  threads: DecisionThread[];
-}
-```
-
-### Decision Thread
-
-```typescript
-interface DecisionThread {
-  id: string;                          // unique within Room
+// Room entity
+interface RoomItem {
+  PK: `TEAM#${string}`;
+  SK: `ROOM#${string}`;
+  GSI2PK?: `USER#${string}`;
+  GSI2SK?: `ROOM#${string}`;
+  entityType: 'ROOM';
   roomId: string;
-  topic: string;
-  status: ThreadStatus;
-  messages: Message[];
-  options: ArchitectureOption[];
-  tradeoffTable?: TradeoffTable;
-  selectedOptionId?: string;
-  adr?: ADR;
-  crossReferences: CrossReference[];
-  createdAt: Date;
-  statusHistory: StatusTransition[];
+  teamId: string;
+  name: string;
+  createdBy: string;
+  createdAt: string; // ISO 8601
+  threadCount: number;
 }
 
-type ThreadStatus = "DRAFT" | "IN_PROGRESS" | "DECIDED" | "SUPERSEDED";
-
-interface StatusTransition {
-  from: ThreadStatus;
-  to: ThreadStatus;
-  timestamp: Date;
-  metadata?: Record<string, string>;   // e.g., reopening marker, superseding thread
-}
-```
-
-### Thread Status State Machine
-
-```mermaid
-stateDiagram-v2
-    [*] --> DRAFT
-    DRAFT --> IN_PROGRESS : first message sent
-    IN_PROGRESS --> DECIDED : option approved
-    DECIDED --> IN_PROGRESS : reopened
-    DECIDED --> SUPERSEDED : superseded by new thread
-```
-
-Valid transitions:
-| From | To | Trigger |
-|------|-----|---------|
-| DRAFT | IN_PROGRESS | First message sent |
-| IN_PROGRESS | DECIDED | User approves option |
-| DECIDED | IN_PROGRESS | User reopens thread |
-| DECIDED | SUPERSEDED | New thread supersedes |
-
-### Message
-
-```typescript
-interface Message {
-  id: string;
+// Decision Thread entity
+interface ThreadItem {
+  PK: `ROOM#${string}`;
+  SK: `THREAD#${string}`;
+  GSI1PK: `ROOM#${string}`;
+  GSI1SK: `STATUS#${ThreadStatus}#DATE#${string}`;
+  entityType: 'THREAD';
   threadId: string;
-  sender: "user" | "ai_architect";
-  content: string;
-  timestamp: Date;
-}
-```
-
-### ADR
-
-```typescript
-interface ADR {
-  id: string;                          // sequential within Room: "ADR-001", "ADR-002", etc.
+  roomId: string;
   title: string;
-  date: Date;
-  status: "ACCEPTED" | "SUPERSEDED";
+  status: ThreadStatus;
+  createdBy: string;
+  createdAt: string;
+  updatedAt: string;
+  selectedOption?: string;
+  reopenMarkers?: { timestamp: string; reason: string }[];
+  supersededBy?: string;
+}
+
+// Message entity
+interface MessageItem {
+  PK: `THREAD#${string}`;
+  SK: `MSG#${string}#${string}`;
+  entityType: 'MESSAGE';
+  messageId: string;
+  threadId: string;
+  sender: string; // userId or 'ai_architect'
+  content: string;
+  structuredData?: {
+    type: 'options' | 'tradeoff_table' | 'clarifying_questions' | 'adr';
+    payload: unknown;
+  };
+  createdAt: string;
+}
+
+// ADR entity
+interface ADRItem {
+  PK: `ROOM#${string}`;
+  SK: `ADR#${string}`;
+  GSI3PK: `ROOM#${string}`;
+  GSI3SK: `ADR_SEQ#${string}`; // zero-padded: ADR_SEQ#001
+  entityType: 'ADR';
+  adrId: string;
+  roomId: string;
+  threadId: string;
+  sequentialId: number;
+  title: string;
+  status: 'ACTIVE' | 'SUPERSEDED';
+  date: string;
   context: string;
-  optionsConsidered: ArchitectureOption[];
+  optionsConsidered: { name: string; summary: string }[];
   decision: string;
   consequences: string;
-  relatedDecisions?: RelatedDecisionRef[];
-  diagrams?: DiagramRef[];
+  relatedDecisions: { adrId: string; title: string; relationship: string }[];
+  diagramS3Key?: string;
+  s3ExportKey?: string;
+  createdAt: string;
+  updatedAt: string;
 }
 
-interface RelatedDecisionRef {
-  adrId: string;
-  title: string;
-}
-
-interface DiagramRef {
-  fileName: string;
-  relativePath: string;
-}
-```
-
-### Tradeoff Table
-
-```typescript
-interface TradeoffTable {
-  options: string[];                   // option IDs (rows)
-  constraints: string[];               // user's constraints (columns)
-  cells: TradeoffCell[][];             // [option_index][constraint_index]
-  version: number;                     // increments on regeneration
-}
-
-interface TradeoffCell {
-  rating: "Strong" | "Moderate" | "Weak" | "N/A";
-  explanation: string;
-}
-```
-
-### Cross-Reference
-
-```typescript
-interface CrossReference {
-  fromThreadId: string;
-  toThreadId: string;
-  relationship: "depends_on" | "contradicts" | "supersedes" | "related";
+// Cross-Reference entity
+interface CrossReferenceItem {
+  PK: `THREAD#${string}`;
+  SK: `XREF#${string}`;
+  entityType: 'CROSS_REFERENCE';
+  sourceThreadId: string;
+  targetThreadId: string;
+  referenceType: 'SUPERSEDES' | 'DEPENDS_ON' | 'CONTRADICTS' | 'RELATED_TO';
   description: string;
+  createdAt: string;
+}
+
+// Embedding entity
+interface EmbeddingItem {
+  PK: `ROOM#${string}`;
+  SK: `EMB#${string}#${string}`;
+  entityType: 'EMBEDDING';
+  roomId: string;
+  entityId: string;
+  entityTypeRef: 'THREAD' | 'ADR';
+  embedding: number[]; // 1536-dimensional Titan vector
+  textSummary: string; // ≤200 chars for search result display
+  createdAt: string;
+  updatedAt: string;
 }
 ```
 
+#### Access Patterns Summary
 
+| Operation | Key Condition | Index |
+|-----------|--------------|-------|
+| Get all rooms for a team | PK = `TEAM#{teamId}`, SK begins_with `ROOM#` | Table |
+| Get all threads in a room | PK = `ROOM#{roomId}`, SK begins_with `THREAD#` | Table |
+| Get messages in a thread (chronological) | PK = `THREAD#{threadId}`, SK begins_with `MSG#` | Table |
+| Get ADRs in a room | PK = `ROOM#{roomId}`, SK begins_with `ADR#` | Table |
+| Get cross-references for a thread | PK = `THREAD#{threadId}`, SK begins_with `XREF#` | Table |
+| Filter threads by status + date | GSI1PK = `ROOM#{roomId}`, GSI1SK between range | GSI1 |
+| List rooms for a user | GSI2PK = `USER#{userId}` | GSI2 |
+| Get next ADR sequential ID | GSI3PK = `ROOM#{roomId}`, SK begins_with `ADR_SEQ#` (reverse, limit 1) | GSI3 |
+| Semantic search (all embeddings in room) | PK = `ROOM#{roomId}`, SK begins_with `EMB#` | Table |
 
 ## Correctness Properties
 
@@ -344,177 +580,298 @@ interface CrossReference {
 
 ### Property 1: Room creation invariants
 
-*For any* string of length 1 to 100 characters (inclusive) that does not duplicate an existing room name, calling `createRoom` shall produce a Room with a unique non-empty ID, the exact name provided, a creation timestamp not in the future, and an empty threads list.
+*For any* string with length between 1 and 100 characters (inclusive), calling `createRoom` with that name SHALL produce a Room with a unique non-empty ID, the exact given name, a valid ISO 8601 creation timestamp, a threadCount of 0, and the correct team association.
 
 **Validates: Requirements 1.1, 1.2**
 
-### Property 2: Room name validation rejects invalid inputs
+### Property 2: Invalid room name rejection
 
-*For any* string that is empty, composed entirely of whitespace, exceeds 100 characters, or duplicates an existing room name, calling `createRoom` shall return an error indicating the specific reason for rejection, and no Room shall be created.
+*For any* string that is empty, composed entirely of whitespace, or exceeds 100 characters in length, calling `validateRoomName` SHALL return an error Result with the appropriate error kind (`EMPTY_NAME` or `NAME_TOO_LONG`).
 
 **Validates: Requirements 1.5**
 
-### Property 3: Room view includes all threads
+### Property 3: Thread creation produces DRAFT status
 
-*For any* Room containing N Decision_Threads, the view representation shall include exactly N entries, each containing the thread's current Thread_Status and creation date.
-
-**Validates: Requirements 1.3**
-
-### Property 4: Thread creation produces DRAFT status
-
-*For any* valid Room and topic string, creating a new Decision_Thread shall produce a thread with Thread_Status DRAFT, a unique identifier within the Room, and the given topic.
+*For any* valid Room and any non-empty title string, calling `createThread` SHALL produce a DecisionThread with status `DRAFT`, a unique non-empty threadId, and the provided title.
 
 **Validates: Requirements 2.1**
 
-### Property 5: Valid state machine transitions
+### Property 4: Valid thread transitions produce correct state
 
-*For any* Decision_Thread, the following transitions shall succeed and update the status accordingly: DRAFT → IN_PROGRESS (on first message), IN_PROGRESS → DECIDED (on option approval), DECIDED → IN_PROGRESS (on reopen, preserving all messages and appending a reopening marker), DECIDED → SUPERSEDED (on supersede, storing cross-reference to replacing thread).
+*For any* DecisionThread in a given status, applying a transition to a status that exists in `VALID_TRANSITIONS[currentStatus]` SHALL succeed and produce a thread with the target status and an updated timestamp. Specifically:
+- DRAFT → IN_PROGRESS records a transition timestamp
+- IN_PROGRESS → DECIDED records the selected option
+- DECIDED → IN_PROGRESS appends a reopen marker with timestamp and reason
+- DECIDED → SUPERSEDED stores the superseding thread's ID as a cross-reference
 
 **Validates: Requirements 2.2, 2.3, 2.4, 2.5**
 
-### Property 6: Invalid state machine transitions are rejected
+### Property 5: Invalid thread transitions are rejected
 
-*For any* Decision_Thread in any Thread_Status, attempting a transition not in the valid transitions set shall be rejected with an error that specifies the current status, the attempted status, and the list of valid transitions from the current state.
+*For any* DecisionThread with status S and *for any* target status T where T is NOT in `VALID_TRANSITIONS[S]`, calling `transition(thread, T)` SHALL return an error Result with kind `INVALID_TRANSITION` containing the current status, attempted target, and the list of valid target statuses from S.
 
 **Validates: Requirements 2.6**
 
-### Property 7: Option proposal structural invariants
+### Property 6: Option proposal structural validity
 
-*For any* OptionProposal generated by the AI Architect, the proposal shall contain between 2 and 5 options (inclusive), each option shall differ from every other option in at least one primary architectural approach, each option shall have a summary of at most 200 characters, at least 2 benefits, at least 2 risks, and a complexity rating in {Low, Medium, High}. The associated TradeoffTable shall have one row per option and one column per stated constraint, with each cell containing a valid rating.
+*For any* OptionProposal generated by the AI Architect, the proposal SHALL contain between 2 and 5 options (inclusive). Each option SHALL have: a summary of at most 200 characters, at least 2 benefits, at least 2 risks, and a complexity value in the set {Low, Medium, High}. The accompanying TradeoffTable SHALL have exactly one row per option and one column per stated constraint.
 
-**Validates: Requirements 3.1, 3.2, 3.3**
+**Validates: Requirements 3.2, 3.3**
 
-### Property 8: Clarifying questions include relevance explanations
+### Property 7: Clarifying questions are well-formed
 
-*For any* set of clarifying questions produced by the AI Architect, each question shall include a non-empty explanation referencing the specific constraint or tradeoff it would clarify.
+*For any* set of clarifying questions generated by `assessInputSufficiency`, the set SHALL contain between 1 and 5 questions (inclusive), and each question SHALL include a non-empty relevance explanation referencing the specific constraint or tradeoff it would clarify.
 
-**Validates: Requirements 4.2**
+**Validates: Requirements 4.1, 4.2**
 
-### Property 9: ADR contains all required sections
+### Property 8: ADR contains all required sections
 
-*For any* Decision_Thread that transitions to DECIDED, the generated ADR shall contain: a sequential identifier matching the pattern "ADR-NNN" within the Room, a title, a date, status "ACCEPTED", context, options considered, decision, and consequences. If the thread has Cross_References, the ADR shall include a "Related Decisions" section listing each referenced ADR by ID and title. If diagrams were generated, the ADR shall include a "Diagrams" section with file name and relative path for each diagram.
+*For any* ADR generated from a decided thread, the ADR SHALL contain: a sequential identifier matching the pattern `ADR-NNN`, a non-empty title, a valid date, a status of `ACTIVE`, non-empty context, at least 2 options considered (matching the thread's proposals), a non-empty decision statement, and non-empty consequences section.
 
-**Validates: Requirements 5.1, 5.3, 8.2**
+**Validates: Requirements 5.1**
 
-### Property 10: Superseded ADR status update
+### Property 9: ADR includes cross-references when present
 
-*For any* ADR with status "ACCEPTED", when its Decision_Thread is superseded, the ADR's status shall become "SUPERSEDED" and it shall store a reference to the superseding ADR's identifier.
+*For any* DecisionThread that has one or more CrossReferences, the generated ADR SHALL include a "Related Decisions" section listing every referenced ADR by its identifier and title.
+
+**Validates: Requirements 5.3**
+
+### Property 10: ADR supersession updates status correctly
+
+*For any* ADR with status `ACTIVE`, when the associated thread is superseded, the ADR status SHALL update to `SUPERSEDED` and SHALL store a reference to the superseding ADR's identifier.
 
 **Validates: Requirements 5.4**
 
-### Property 11: Cross-reference detection for shared attributes
+### Property 11: Insufficient context ADR error enumerates missing sections
 
-*For any* pair of Decision_Threads or ADRs that share constraints, technology choices, or problem domain keywords, the Cross-Reference Engine shall identify the relationship and produce a reference with the correct ADR identifier and a description of the relevance.
+*For any* thread data that is missing one or more required ADR sections (context, decision, options), the ADR generation SHALL return an error Result with kind `INSUFFICIENT_CONTEXT` containing a `missingSections` array that lists exactly those sections that lack sufficient information.
 
-**Validates: Requirements 6.2**
+**Validates: Requirements 5.6**
 
-### Property 12: Contradiction and dependency detection
+### Property 12: Semantic search results are ranked by similarity and bounded
 
-*For any* proposed ArchitectureOption that contradicts a prior DECIDED ADR (e.g., proposes a technology explicitly rejected in the prior ADR) or depends on an assumption from a prior ADR, the Cross-Reference Engine shall identify the specific prior ADR by identifier, classify the relationship as "contradicts" or "depends_on", and describe the impact.
+*For any* set of embedding vectors in a room and *for any* query embedding, the search results SHALL be returned in descending order of cosine similarity score and SHALL contain at most 50 results, all with similarity scores ≥ 0.7.
 
-**Validates: Requirements 6.3**
+**Validates: Requirements 7.1, 7.5**
 
-### Property 13: Room change summary completeness
+### Property 13: Structured filters intersect correctly with results
 
-*For any* Room and a given date, `summarizeChangesSince` shall return all ADRs created after that date, all threads that reference the target thread, and all threads that transitioned to SUPERSEDED after that date.
-
-**Validates: Requirements 6.4**
-
-### Property 14: Search results structural invariants
-
-*For any* search query against any dataset, the results shall contain at most 50 matches, each match shall include a non-null title, Thread_Status, date, and a summary of at most 200 characters, and results shall be ordered by descending relevance score.
-
-**Validates: Requirements 7.1, 7.3**
-
-### Property 15: Search filters produce correct subsets
-
-*For any* search query with a status filter, all returned results shall have that status. For any search with a date range filter, all returned results shall have dates within the specified range (inclusive).
+*For any* combination of filters (status, date range, title substring) applied to a set of threads/ADRs, every result SHALL satisfy ALL applied filter criteria simultaneously. Results not matching any single filter SHALL be excluded.
 
 **Validates: Requirements 7.2**
 
-### Property 16: Empty search query rejection
+### Property 14: Search result structure completeness
 
-*For any* string that is empty or composed entirely of whitespace characters, the Decision_Journal shall reject the search without executing it and return an error indicating a non-empty query is required.
+*For any* search result returned by the Decision Journal, the result SHALL include: a non-empty title, a valid ThreadStatus, a valid date, a numeric similarity score between 0 and 1, and a text summary of at most 200 characters.
 
-**Validates: Requirements 7.5**
+**Validates: Requirements 7.3**
 
-### Property 17: Persistence round-trip preserves all data
+### Property 15: Empty/whitespace search query rejection
 
-*For any* Room containing Decision_Threads with messages, ADRs, Thread_Status values, Cross_References, TradeoffTables, and timestamps, serializing and then deserializing the Room shall produce a value deeply equal to the original.
+*For any* string that is empty or composed entirely of whitespace characters, calling `semanticSearch` SHALL return an error Result with kind `EMPTY_QUERY` without executing any embedding generation or similarity computation.
 
-**Validates: Requirements 1.4, 9.1, 9.3**
+**Validates: Requirements 7.6**
+
+### Property 16: Cosine similarity is symmetric and bounded
+
+*For any* two embedding vectors of equal dimension, `cosineSimilarity(a, b)` SHALL equal `cosineSimilarity(b, a)` and the result SHALL be in the range [-1, 1].
+
+**Validates: Requirements 7.1** (mathematical correctness of the similarity function)
+
+### Property 17: Team-scoped room access
+
+*For any* Room associated with teamId T, and *for any* user U: if U belongs to team T, access SHALL be granted; if U does NOT belong to team T, access SHALL be denied with an authorization error.
+
+**Validates: Requirements 10.3, 10.4**
+
+### Property 18: User identity attribution
+
+*For any* entity (Message, DecisionThread, or ADR) created by a user, the entity SHALL store the creating user's Cognito identity (userId) in a non-empty `createdBy` or `sender` field.
+
+**Validates: Requirements 10.7**
+
+### Property 19: Write retry with exponential backoff
+
+*For any* DynamoDB write failure sequence, the retry mechanism SHALL attempt at most 3 retries, and the delay between attempt N and attempt N+1 SHALL be greater than or equal to `baseDelay * 2^N` milliseconds.
+
+**Validates: Requirements 9.4**
 
 ## Error Handling
 
-### Persistence Failures
+All domain operations use the `Result<T, E>` pattern. Exceptions are never thrown in business logic — they are caught at the service boundary and converted to typed error results.
 
-- **Write failures**: When persistence encounters a write error, the system retries up to 3 times with exponential backoff.
-- **Retry exhaustion**: If all 3 retries fail, the system displays an error to the user and preserves unsaved content in a local buffer. The buffer is flushed when persistence is restored.
-- **Read failures**: On room open/restore, a read failure surfaces a user-facing error. No retry is needed since the user can try again.
+### Error Flow Architecture
 
-### ADR Generation Failures
+```mermaid
+graph TD
+    subgraph "API Layer (Lambda Handler)"
+        H[Handler] --> |"try/catch boundary"| SVC[Service Call]
+        SVC --> |"Result<T, E>"| MAP[Error Mapper]
+        MAP --> |"HTTP Response"| RES[API Response]
+    end
 
-- **Insufficient context**: The ADR Generator identifies which required sections (context, options, decision, consequences) lack sufficient information and returns a structured error listing them.
-- **System errors**: On transient failure, the system retries ADR generation up to 3 times. After exhaustion, the thread remains DECIDED but without an ADR, and the user is notified.
+    subgraph "Domain Layer"
+        DL[Domain Function] --> |"Result<T, E>"| RET[Return to caller]
+    end
 
-### Diagram Generation Failures
+    subgraph "Service Layer"
+        AWS[AWS SDK Call] --> |"try/catch"| WRAP[Wrap in Result]
+        WRAP --> |"Result<T, E>"| DL
+    end
+```
 
-- **Non-blocking**: Diagram generation failure does not block the DECIDED transition. The user is notified with the failure reason, and the ADR is generated without a Diagrams section.
+### Error Categories and Handling Strategy
 
-### State Machine Violations
+| Category | Error Types | Strategy | User-Facing Behavior |
+|----------|-------------|----------|---------------------|
+| Validation | `EMPTY_NAME`, `NAME_TOO_LONG`, `DUPLICATE_NAME`, `EMPTY_QUERY`, `INVALID_TRANSITION` | Return immediately, no retry | 400 with specific message |
+| Persistence | `WRITE_FAILURE`, `READ_FAILURE` | Retry up to 3× with exponential backoff (100ms base) | 503 if retries exhausted; preserve locally |
+| AI/Bedrock | `INVOCATION_FAILURE`, `RATE_LIMITED` | Retry up to 3× for transient; backoff for rate limit | 503 with "AI temporarily unavailable" |
+| Authorization | Token expired/invalid, team mismatch | No retry | 401 or 403; redirect to sign-in |
+| Not Found | Room/thread/ADR does not exist | No retry | 404 with entity type |
+| Structural | `RESPONSE_VALIDATION_FAILURE` | Retry once (AI may produce valid response on retry) | 500 with "unexpected response format" |
 
-- **Invalid transitions**: The state machine rejects invalid transitions synchronously, returning the current state, attempted state, and valid transitions. No side effects occur on rejection.
+### Retry Logic (Pseudocode)
 
-### Search Failures
+```typescript
+async function withRetry<T, E extends { kind: string }>(
+  operation: () => Promise<Result<T, E>>,
+  options: { maxRetries: number; baseDelayMs: number; retryableKinds: string[] }
+): Promise<Result<T, E & { kind: 'RETRIES_EXHAUSTED'; attempts: number; lastError: string }>> {
+  let lastError: E | undefined;
 
-- **Empty query**: Rejected at the input validation layer before execution.
-- **No results**: Returns an empty result set with a suggestion to broaden search terms.
-- **Timeout**: If search exceeds 2 seconds, the operation is cancelled and the user is informed to refine their query.
+  for (let attempt = 0; attempt <= options.maxRetries; attempt++) {
+    const result = await operation();
 
-### AI Service Failures
+    if (result.ok) return result;
 
-- **Timeout/unavailability**: AI operations that fail are surfaced to the user with a retry option. The thread state is not altered by failed AI operations.
-- **Malformed AI output**: If AI output fails structural validation (e.g., < 2 options, summary > 200 chars), the system logs the violation and requests regeneration before presenting to the user.
+    lastError = result.error;
+
+    if (!options.retryableKinds.includes(result.error.kind)) {
+      return result; // Non-retryable, return immediately
+    }
+
+    if (attempt < options.maxRetries) {
+      const delay = options.baseDelayMs * Math.pow(2, attempt);
+      await sleep(delay);
+    }
+  }
+
+  return err({
+    kind: 'RETRIES_EXHAUSTED' as const,
+    attempts: options.maxRetries + 1,
+    lastError: JSON.stringify(lastError),
+  });
+}
+```
+
+### Client-Side Error Recovery
+
+When the backend returns a persistence failure after retries are exhausted:
+1. The SWR mutation is marked as failed
+2. The message is stored in `localStorage` with a `pendingSync` flag
+3. A retry banner is displayed to the user
+4. On next successful request, pending messages are flushed in order
+
+### AI Response Validation
+
+All Bedrock responses are structurally validated before presentation:
+
+```typescript
+function validateOptionProposal(raw: unknown): Result<OptionProposal, AIError> {
+  // Zod schema validation
+  const parsed = optionProposalSchema.safeParse(raw);
+  if (!parsed.success) {
+    return err({
+      kind: 'RESPONSE_VALIDATION_FAILURE',
+      rawResponse: JSON.stringify(raw),
+    });
+  }
+
+  // Business rule validation
+  const { options, tradeoffTable } = parsed.data;
+  if (options.length < 2 || options.length > 5) { /* ... */ }
+  for (const option of options) {
+    if (option.summary.length > 200) { /* ... */ }
+    if (option.benefits.length < 2) { /* ... */ }
+    if (option.risks.length < 2) { /* ... */ }
+  }
+
+  return ok(parsed.data);
+}
+```
 
 ## Testing Strategy
 
-### Unit Tests
+### Overview
 
-Focus on deterministic, pure-logic components:
+The testing approach uses two complementary strategies:
+- **Property-based tests** verify universal invariants across randomized inputs (minimum 100 iterations each)
+- **Example-based unit tests** verify specific scenarios, integration points, and edge cases
 
-- **State machine transitions**: All valid and invalid transitions with various thread states
-- **Room name validation**: Boundary cases (empty, 1 char, 100 chars, 101 chars, whitespace, duplicates)
-- **Search query validation**: Empty, whitespace-only, valid queries
-- **ADR ID sequencing**: Verify sequential numbering within a room
-- **TradeoffTable structure validation**: Correct dimensions, valid cell ratings
-- **Cross-reference relationship classification**: Known contradiction/dependency scenarios
+### Property-Based Testing
 
-### Property-Based Tests
+**Library**: [fast-check](https://github.com/dubzzz/fast-check) (TypeScript PBT library)
 
-Each correctness property (Properties 1–17) maps to a property-based test using a PBT library (e.g., fast-check for TypeScript). Configuration:
+Each correctness property from the design document maps to a single `fast-check` test with minimum 100 iterations.
 
-- **Minimum 100 iterations** per property test
-- **Tag format**: `Feature: architecture-decision-room, Property {N}: {title}`
-- **Generators**: Custom generators for Room, DecisionThread, Message, ADR, ArchitectureOption, TradeoffTable, SearchQuery
-- **Shrinking**: Rely on library shrinking to find minimal counterexamples
+**Tag format**: `Feature: architecture-decision-room, Property {N}: {title}`
 
-Key generators:
-- `arbitraryRoomName`: String of length 1–100, alphanumeric + spaces
-- `arbitraryThread`: DecisionThread with random status, 0–20 messages, 0–5 options
-- `arbitraryRoom`: Room with 0–10 threads in various states
-- `arbitraryADR`: ADR with all required fields populated randomly
-- `arbitrarySearchQuery`: Non-empty string with optional filters
+**Properties to implement:**
+
+| Property | Module Under Test | Generator Strategy |
+|----------|-------------------|-------------------|
+| 1: Room creation invariants | `room-manager.ts` | Random strings 1-100 chars, random team IDs |
+| 2: Invalid room name rejection | `room-manager.ts` | Empty strings, whitespace strings, strings 101-1000 chars |
+| 3: Thread creation DRAFT | `thread-lifecycle.ts` | Random room IDs, random title strings |
+| 4: Valid transitions | `thread-lifecycle.ts` | Random threads in each status, valid target from VALID_TRANSITIONS map |
+| 5: Invalid transitions | `thread-lifecycle.ts` | Random threads, targets NOT in VALID_TRANSITIONS |
+| 6: Option proposal structure | `ai-architect.ts` | Random option counts (2-5), random constraint lists (mock Bedrock) |
+| 7: Clarifying questions | `ai-architect.ts` | Random question sets from mock responses |
+| 8: ADR required sections | `adr-generator.ts` | Random decided threads with full context |
+| 9: ADR cross-references | `adr-generator.ts` | Random threads with 1-5 cross-references |
+| 10: ADR supersession | `adr-generator.ts` | Random active ADRs, random superseding IDs |
+| 11: Insufficient context error | `adr-generator.ts` | Random subsets of required fields removed |
+| 12: Search ranking & bounds | `decision-journal.ts` | Random embedding vectors (1536-dim), random query vectors |
+| 13: Filter intersection | `decision-journal.ts` | Random thread sets with varied attributes, random filter combos |
+| 14: Search result structure | `decision-journal.ts` | Random search results |
+| 15: Empty query rejection | `decision-journal.ts` | Whitespace-only and empty strings |
+| 16: Cosine similarity properties | `decision-journal.ts` | Random pairs of equal-dimension vectors |
+| 17: Team-scoped access | `room-manager.ts` + auth | Random user/team/room combinations |
+| 18: User identity attribution | All creation functions | Random user IDs with entity creation |
+| 19: Retry exponential backoff | `dynamo.ts` | Random failure sequences (1-3 failures) |
+
+### Example-Based Unit Tests
+
+| Area | Tests |
+|------|-------|
+| Room restoration | Load room with threads, messages, ADRs — verify completeness |
+| Write-before-acknowledge | Message persistence order verification |
+| ADR retry on system error | Mock 3 failures, verify retry count |
+| Diagram failure non-blocking | Mock diagram failure, verify thread still transitions |
+| Single viable option | Mock single-option Bedrock response, verify messaging |
+| No related decisions | Empty room cross-reference check |
+| Token expiry redirect | Expired JWT → 401 + redirect behavior |
 
 ### Integration Tests
 
-- **Persistence round-trip**: Full save/load cycle with real storage backend
-- **AI response validation**: End-to-end test with AI service, validating structural constraints
-- **Diagram generation**: Verify .drawio file creation and valid XML structure
-- **Search performance**: Verify results within 2-second timeout
-- **ADR generation timing**: Verify generation within 30-second window
+| Area | Tests |
+|------|-------|
+| DynamoDB CRUD | Full lifecycle: create room → thread → messages → ADR → search |
+| Bedrock invocation | Real Claude call with structured prompt → validate response |
+| S3 upload/download | ADR export and diagram upload round-trip |
+| Cognito auth flow | Sign-up → sign-in → token → authorized request |
+| Embedding pipeline | Generate embedding → store → retrieve → cosine similarity |
 
-### End-to-End Tests
+### Test Configuration
 
-- **Complete decision workflow**: Create room → create thread → send messages → receive AI options → approve option → verify ADR generated
-- **Cross-session persistence**: Start a thread, close session, reopen, verify full context available
-- **Supersession flow**: Decide thread A → create thread B → supersede A → verify cross-references and ADR status updates
+```typescript
+// fast-check configuration for all property tests
+const FC_CONFIG = {
+  numRuns: 100,        // minimum iterations per property
+  verbose: true,       // log failing examples
+  seed: undefined,     // random seed (set for reproducibility in CI)
+  endOnFailure: true,  // stop on first failure for faster feedback
+};
+```
+
