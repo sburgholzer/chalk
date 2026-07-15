@@ -134,16 +134,22 @@ Chalk is an Architecture Decision Room — a living workspace where humans colla
 4. IF the DynamoDB_Table encounters a write failure, THEN THE Room SHALL notify the user of the failure and retry the operation up to 3 times with exponential backoff
 5. IF all retry attempts are exhausted after a write failure, THEN THE Room SHALL display an error indication to the user and preserve the unsaved content locally until persistence to the DynamoDB_Table is restored
 
-### Requirement 10: User Authentication and Team Authorization
+### Requirement 10: User Authentication and Team Administration
 
-**User Story:** As a team member, I want to authenticate with my identity and access only the rooms my team owns, so that architecture decisions are secure and scoped to authorized users.
+**User Story:** As a team member, I want to authenticate with my identity and access only the rooms my team owns, so that architecture decisions are secure and scoped to authorized users. As a team admin, I want to invite and remove team members through the web interface, so that I can manage access without leaving the application.
 
 #### Acceptance Criteria
 
 1. WHEN a user accesses the application, THE API_Gateway SHALL require a valid Cognito_User access token before processing any request
-2. WHEN a new user signs up, THE Cognito_User SHALL be created in the Amazon Cognito User Pool with a verified email address and assigned to a default team group
+2. WHEN a team administrator invites a new user via the web interface, THE Cognito_User SHALL be created in the Amazon Cognito User Pool with a verified email address and assigned to the administrator's team group
 3. WHEN a Cognito_User creates a Room, THE Room SHALL be associated with the user's team group, and only Cognito_Users belonging to that team group SHALL have access to the Room
 4. WHEN a Cognito_User attempts to access a Room belonging to a team group the user is not a member of, THE API_Gateway SHALL reject the request with an authorization error
 5. WHEN a team administrator adds or removes a Cognito_User from a team group, THE Room access permissions SHALL update immediately for the affected user
 6. IF a Cognito_User access token is expired or invalid, THEN THE API_Gateway SHALL return an authentication error and the frontend SHALL redirect the user to the sign-in page
 7. THE Cognito_User identity SHALL be attached to all messages, Decision_Threads, and ADRs created by that user, enabling attribution of contributions within a Room
+8. WHEN a team administrator accesses the Team Management page, THE web interface SHALL display a list of all team members with their email, role (admin or member), and status (active, invited, disabled)
+9. WHEN a team administrator invites a new user by providing an email address and selecting a role (admin or member), THE system SHALL create the Cognito_User via AdminCreateUser, assign them to the team group, store their role, and send an invitation email with a temporary password
+10. WHEN a team administrator removes a user from the team, THE system SHALL remove the Cognito_User from the team group, revoke their access to all Rooms in that team, and mark them as disabled in the team member list
+11. WHEN a team administrator promotes a member to admin or demotes an admin to member, THE system SHALL update the user's role immediately and adjust their permissions accordingly
+12. ONLY Cognito_Users with the admin role SHALL have access to the Team Management page and the ability to invite, remove, promote, or demote users
+13. IF a non-admin user attempts to access the Team Management page or invoke an admin-only API endpoint, THEN THE system SHALL reject the request with an authorization error

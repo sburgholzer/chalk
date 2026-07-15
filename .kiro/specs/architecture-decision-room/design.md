@@ -100,6 +100,7 @@ sequenceDiagram
     Auth-->>AG: Token valid + team claims
     AG->>Lambda: Invoke with event
     Lambda->>DDB: PutItem (persist message)
+    Note right of DDB: Message MUST be persisted before<br/>acknowledging to client (Req 9.2)
     DDB-->>Lambda: Write confirmed
     Lambda->>Bedrock: InvokeModel (Claude)
     Bedrock-->>Lambda: AI response
@@ -202,7 +203,16 @@ export type AIError =
   | { kind: 'BEDROCK_INVOCATION_FAILURE'; cause: string }
   | { kind: 'RESPONSE_VALIDATION_FAILURE'; rawResponse: string }
   | { kind: 'INSUFFICIENT_CONTEXT'; missing: string[] }
-  | { kind: 'RATE_LIMITED'; retryAfterMs: number };
+  | { kind: 'RATE_LIMITED'; retryAfterMs: number }
+  | { kind: 'TIMEOUT'; elapsedMs: number };
+
+// Clarifying question triggers (Requirement 4.1):
+// The AI Architect asks clarifying questions when the user's input lacks:
+// - Scale requirements (expected load, data volume, user count)
+// - Deployment environment (cloud provider, on-prem, hybrid, edge)
+// - Team size and expertise (available engineers, familiarity with tech)
+// - Technology preferences or constraints (language, framework, existing stack)
+// If none of these are ambiguous, the AI proceeds directly to option proposals.
 
 export function assessInputSufficiency(
   messages: Message[],
@@ -219,11 +229,34 @@ export function proposeOptions(params: {
   priorDecisions: { id: string; title: string; relevance: string }[];
 }): Promise<Result<OptionProposal, AIError>>;
 
+// When constraints are too restrictive for 2+ distinct options (Requirement 3.5),
+// the AI returns a SingleOptionResult instead. The caller checks the discriminant
+// and presents the single option with relaxation suggestions to the user.
+export type ProposalResult =
+  | { kind: 'multiple_options'; proposal: OptionProposal }
+  | { kind: 'single_option'; option: ArchitectureOption; relaxationSuggestions: string[] };
+
+export function proposeOptionsWithFallback(params: {
+  messages: Message[];
+  constraints: string[];
+  priorDecisions: { id: string; title: string; relevance: string }[];
+}): Promise<Result<ProposalResult, AIError>>;
+
 export function regenerateTradeoffTable(params: {
   previousTable: TradeoffTable;
   newConstraints: string[];
   messages: Message[];
-}): Promise<Result<{ table: TradeoffTable; changes: string[] }, AIError>>;
+}): Promise<Result<{ table: TradeoffTable; changes: TradeoffChange[] }, AIError>>;
+
+// Tracks exactly what changed between table versions (Requirement 3.4)
+export interface TradeoffChange {
+  optionId: string;
+  field: 'summary' | 'benefits' | 'risks' | 'complexity' | 'tradeoff_rating';
+  constraintName?: string;       // for tradeoff_rating changes
+  previousValue: string;
+  newValue: string;
+  reason: string;                // why this assessment changed
+}
 ```
 
 #### ADR Generator (`adr-generator.ts`)
@@ -237,7 +270,12 @@ import { ADR, DecisionThread, CrossReference } from '@/types/domain';
 export type ADRError =
   | { kind: 'INSUFFICIENT_CONTEXT'; missingSections: string[] }
   | { kind: 'GENERATION_FAILURE'; cause: string; attempt: number }
-  | { kind: 'S3_UPLOAD_FAILURE'; cause: string };
+  | { kind: 'S3_UPLOAD_FAILURE'; cause: string }
+  | { kind: 'TIMEOUT'; elapsedMs: number };
+
+// ADR generation MUST complete within 30 seconds of thread DECIDED transition (Requirement 5.2).
+// If the timeout is exceeded, the generation is cancelled and retried (up to 3 attempts).
+const ADR_GENERATION_TIMEOUT_MS = 30_000;
 
 export function generateADR(params: {
   thread: DecisionThread;
@@ -271,6 +309,21 @@ export function createCrossReference(params: {
   description: string;
 }): Result<CrossReference, CrossRefError>;
 
+// Summarizes all changes in a Room since a given date (Requirement 6.4).
+// Used when a user revisits a DECIDED thread — the AI reports what happened since.
+export function summarizeChangesSince(params: {
+  roomId: RoomId;
+  sinceDate: Date;
+  focusThreadId?: ThreadId; // optional: highlight references to this thread
+}): Promise<Result<RoomChangeSummary, CrossRefError>>;
+
+export interface RoomChangeSummary {
+  newADRs: { adrId: string; title: string; date: string }[];
+  threadsReferencingFocus: { threadId: string; title: string; referenceType: ReferenceType }[];
+  supersededThreads: { threadId: string; title: string; supersededBy: string }[];
+  totalChanges: number;
+}
+
 export function findRelatedDecisions(params: {
   roomId: RoomId;
   currentThreadId: ThreadId;
@@ -285,6 +338,49 @@ export function getReferencesForThread(
 ): Promise<Result<CrossReference[], CrossRefError>>;
 ```
 
+#### Diagram Generator (`diagram-generator.ts`)
+
+Generates .drawio XML diagrams for infrastructure-related architecture decisions and option comparisons.
+
+```typescript
+import { Result } from '@/types/result';
+import { DecisionThread, ArchitectureOption } from '@/types/domain';
+
+export type DiagramError =
+  | { kind: 'GENERATION_FAILURE'; cause: string }
+  | { kind: 'S3_UPLOAD_FAILURE'; cause: string }
+  | { kind: 'NOT_INFRASTRUCTURE'; reason: string };
+
+// Determines whether a decided thread involves infrastructure-related architecture
+// (cloud services, networking, deployment pipelines, containerization, databases,
+// storage, messaging systems, or compute resources). If not, returns NOT_INFRASTRUCTURE.
+export function isInfrastructureDecision(thread: DecisionThread): boolean;
+
+// Generates a .drawio diagram for a DECIDED thread showing system components,
+// connections, and data flow direction (Requirement 8.1).
+export function generateDecisionDiagram(params: {
+  thread: DecisionThread;
+  selectedOption: ArchitectureOption;
+}): Promise<Result<DiagramFile, DiagramError>>;
+
+// Generates a draft comparison diagram during deliberation showing each option
+// as a separate labeled section with components and connections (Requirement 8.3).
+export function generateOptionComparisonDiagram(params: {
+  thread: DecisionThread;
+  options: ArchitectureOption[];
+}): Promise<Result<DiagramFile, DiagramError>>;
+
+// Uploads the generated diagram to S3 and returns the object key (Requirement 8.2).
+export function uploadDiagram(diagram: DiagramFile): Promise<Result<{ s3Key: string; fileName: string }, DiagramError>>;
+
+export interface DiagramFile {
+  fileName: string;           // e.g., "adr-003-deployment-pipeline.drawio"
+  content: string;            // .drawio XML content
+  components: string[];       // list of system components included
+  connections: { from: string; to: string; label?: string }[]; // data flow
+}
+```
+
 #### Decision Journal (`decision-journal.ts`)
 
 Handles semantic search and structured filtering of the decision history.
@@ -296,7 +392,12 @@ import { SearchResult, ThreadStatus } from '@/types/domain';
 export type SearchError =
   | { kind: 'EMPTY_QUERY' }
   | { kind: 'EMBEDDING_FAILURE'; cause: string }
-  | { kind: 'QUERY_FAILURE'; cause: string };
+  | { kind: 'QUERY_FAILURE'; cause: string }
+  | { kind: 'TIMEOUT'; elapsedMs: number };
+
+// Search MUST return results within 2 seconds (Requirement 7.1).
+// If the timeout is exceeded, the operation is cancelled and the user is informed.
+const SEARCH_TIMEOUT_MS = 2_000;
 
 export function semanticSearch(params: {
   roomId: string;
@@ -311,6 +412,18 @@ export function semanticSearch(params: {
 }): Promise<Result<SearchResult[], SearchError>>;
 
 export function generateEmbedding(text: string): Promise<Result<number[], SearchError>>;
+
+// Embedding lifecycle hook (Requirement 7.4):
+// Called automatically when a Decision_Thread or ADR is created or updated.
+// Generates a Titan Embedding vector and upserts it to the DynamoDB_Table
+// alongside the source record (EMB#{entityType}#{entityId} sort key).
+export function indexEntity(params: {
+  roomId: string;
+  entityId: string;
+  entityType: 'THREAD' | 'ADR';
+  content: string;        // text to embed (thread title + messages, or ADR context + decision)
+  summary: string;        // ≤200 chars for search result display
+}): Promise<Result<{ embedding: number[] }, SearchError>>;
 
 export function cosineSimilarity(a: number[], b: number[]): number;
 ```
@@ -396,6 +509,111 @@ export function getDocument(key: string): Promise<Result<{ body: string; content
 
 ### Types (`src/types/`)
 
+### Infrastructure Configuration
+
+#### Cognito User Pool Configuration (Requirement 10.2)
+
+The Cognito User Pool is configured with the following settings to satisfy authentication and team authorization requirements:
+
+```typescript
+// CDK / CloudFormation configuration (conceptual)
+const cognitoConfig = {
+  userPool: {
+    selfSignUpEnabled: false,               // Admin-only user creation (no self sign-up)
+    autoVerify: { email: true },            // Email verification on admin-created accounts
+    standardAttributes: {
+      email: { required: true, mutable: true },
+    },
+    passwordPolicy: {
+      minLength: 8,
+      requireUppercase: true,
+      requireDigits: true,
+      requireSymbols: false,
+    },
+    adminCreateUserConfig: {
+      allowAdminCreateUserOnly: true,       // Only admins can invite team members
+      inviteMessageTemplate: {
+        emailSubject: 'Your Chalk workspace invitation',
+        emailMessage: 'You have been invited to Chalk. Your temporary password is {####}.',
+      },
+    },
+  },
+  // Team assignment on user creation:
+  // When an admin creates a user, they also assign the user to a team group
+  // via AdminAddUserToGroup in the same operation.
+  // No post-confirmation trigger needed since admins control the full flow.
+  groups: {
+    // Each team is a Cognito group. Room access is scoped by group membership.
+    // Team admins add/remove users via AdminCreateUser + AdminAddUserToGroup / AdminRemoveUserFromGroup.
+    // Changes are immediate — next token refresh reflects new group claims (Req 10.5).
+  },
+};
+```
+
+#### Team Management Service (`team-management.ts`)
+
+Handles admin operations for inviting, removing, and managing team members through the web interface.
+
+```typescript
+import { Result } from '@/types/result';
+import { TeamId, UserId } from '@/types/domain';
+
+export type TeamRole = 'admin' | 'member';
+export type UserStatus = 'active' | 'invited' | 'disabled';
+
+export interface TeamMember {
+  userId: UserId;
+  email: string;
+  role: TeamRole;
+  status: UserStatus;
+  invitedAt: string;       // ISO 8601
+  invitedBy: UserId;
+  lastActiveAt?: string;
+}
+
+export type TeamManagementError =
+  | { kind: 'NOT_ADMIN'; userId: UserId }
+  | { kind: 'USER_ALREADY_EXISTS'; email: string }
+  | { kind: 'USER_NOT_FOUND'; userId: UserId }
+  | { kind: 'CANNOT_REMOVE_LAST_ADMIN'; teamId: TeamId }
+  | { kind: 'COGNITO_FAILURE'; cause: string }
+  | { kind: 'PERSISTENCE_FAILURE'; cause: string };
+
+// Invites a new user to the team (Requirement 10.9).
+// Creates Cognito user, assigns to team group, stores role, sends invitation email.
+export function inviteUser(params: {
+  email: string;
+  role: TeamRole;
+  teamId: TeamId;
+  invitedBy: UserId;       // must be an admin
+}): Promise<Result<TeamMember, TeamManagementError>>;
+
+// Removes a user from the team (Requirement 10.10).
+// Removes from Cognito group, revokes room access, marks as disabled.
+export function removeUser(params: {
+  userId: UserId;
+  teamId: TeamId;
+  removedBy: UserId;       // must be an admin
+}): Promise<Result<void, TeamManagementError>>;
+
+// Changes a user's role (Requirement 10.11).
+export function changeRole(params: {
+  userId: UserId;
+  teamId: TeamId;
+  newRole: TeamRole;
+  changedBy: UserId;       // must be an admin
+}): Promise<Result<TeamMember, TeamManagementError>>;
+
+// Lists all team members with status and role (Requirement 10.8).
+export function listTeamMembers(params: {
+  teamId: TeamId;
+  requestedBy: UserId;     // must be an admin
+}): Promise<Result<TeamMember[], TeamManagementError>>;
+
+// Checks if a user has admin role for the given team (Requirements 10.12, 10.13).
+export function isTeamAdmin(userId: UserId, teamId: TeamId): Promise<boolean>;
+```
+
 #### Result Type (`result.ts`)
 
 ```typescript
@@ -445,7 +663,7 @@ All entities share a single DynamoDB table (`ChalkTable`) with the following acc
 | CrossRef | `THREAD#{threadId}` | `XREF#{targetThreadId}` | References from thread |
 | Embedding | `ROOM#{roomId}` | `EMB#{entityType}#{entityId}` | Embeddings by room |
 | User | `USER#{userId}` | `PROFILE` | User profile |
-| TeamMember | `TEAM#{teamId}` | `MEMBER#{userId}` | Team membership |
+| TeamMember | `TEAM#{teamId}` | `MEMBER#{userId}` | Team membership + role |
 
 #### Global Secondary Indexes (GSIs)
 
@@ -558,6 +776,21 @@ interface EmbeddingItem {
   createdAt: string;
   updatedAt: string;
 }
+
+// Team Member entity (admin-managed, no self sign-up)
+interface TeamMemberItem {
+  PK: `TEAM#${string}`;
+  SK: `MEMBER#${string}`;
+  entityType: 'TEAM_MEMBER';
+  teamId: string;
+  userId: string;
+  email: string;
+  role: 'admin' | 'member';
+  status: 'active' | 'invited' | 'disabled';
+  invitedBy: string;
+  invitedAt: string;          // ISO 8601
+  lastActiveAt?: string;
+}
 ```
 
 #### Access Patterns Summary
@@ -569,6 +802,7 @@ interface EmbeddingItem {
 | Get messages in a thread (chronological) | PK = `THREAD#{threadId}`, SK begins_with `MSG#` | Table |
 | Get ADRs in a room | PK = `ROOM#{roomId}`, SK begins_with `ADR#` | Table |
 | Get cross-references for a thread | PK = `THREAD#{threadId}`, SK begins_with `XREF#` | Table |
+| List team members | PK = `TEAM#{teamId}`, SK begins_with `MEMBER#` | Table |
 | Filter threads by status + date | GSI1PK = `ROOM#{roomId}`, GSI1SK between range | GSI1 |
 | List rooms for a user | GSI2PK = `USER#{userId}` | GSI2 |
 | Get next ADR sequential ID | GSI3PK = `ROOM#{roomId}`, SK begins_with `ADR_SEQ#` (reverse, limit 1) | GSI3 |
@@ -684,17 +918,83 @@ interface EmbeddingItem {
 
 **Validates: Requirements 10.3, 10.4**
 
-### Property 18: User identity attribution
+### Property 18: Admin-only team management
+
+*For any* user U attempting to invoke `inviteUser`, `removeUser`, `changeRole`, or `listTeamMembers`: if U has role `admin` for the given team, the operation SHALL proceed; if U has role `member` or does not belong to the team, the operation SHALL return an error with kind `NOT_ADMIN`.
+
+**Validates: Requirements 10.12, 10.13**
+
+### Property 19: Cannot remove last admin
+
+*For any* team T with exactly one user with role `admin`, attempting to remove that user or demote them to `member` SHALL return an error with kind `CANNOT_REMOVE_LAST_ADMIN`. The team SHALL always retain at least one admin.
+
+**Validates: Requirements 10.10, 10.11**
+
+### Property 20: User identity attribution
 
 *For any* entity (Message, DecisionThread, or ADR) created by a user, the entity SHALL store the creating user's Cognito identity (userId) in a non-empty `createdBy` or `sender` field.
 
 **Validates: Requirements 10.7**
 
-### Property 19: Write retry with exponential backoff
+### Property 21: Write retry with exponential backoff
 
 *For any* DynamoDB write failure sequence, the retry mechanism SHALL attempt at most 3 retries, and the delay between attempt N and attempt N+1 SHALL be greater than or equal to `baseDelay * 2^N` milliseconds.
 
 **Validates: Requirements 9.4**
+
+### Property 22: ADR generation completes within timeout
+
+*For any* Decision_Thread transitioning to DECIDED, the `generateADR` function SHALL either return a successful Result within 30,000 milliseconds or return a timeout error. If a timeout occurs, the system SHALL retry up to 3 times before surfacing the failure to the user.
+
+**Validates: Requirements 5.2**
+
+### Property 23: Search completes within timeout
+
+*For any* valid search query, the `semanticSearch` function SHALL either return results within 2,000 milliseconds or return a timeout error. The operation SHALL be cancelled (not merely awaited) if the timeout is exceeded.
+
+**Validates: Requirements 7.1**
+
+### Property 24: Tradeoff regeneration tracks changes
+
+*For any* regeneration triggered by new constraints, the returned `TradeoffChange[]` array SHALL contain one entry for each cell, option field, or rating that differs from the previous version. Each entry SHALL identify the option, the changed field, the previous value, the new value, and a reason for the change.
+
+**Validates: Requirements 3.4**
+
+### Property 25: Persist-before-acknowledge ordering
+
+*For any* message sent in a Decision_Thread, the Lambda handler SHALL confirm persistence to DynamoDB before returning a success response to the client. If the DynamoDB write fails (after retries), the handler SHALL return an error response — the client SHALL NOT display the message as sent.
+
+**Validates: Requirements 9.2**
+
+### Property 26: Room change summary completeness
+
+*For any* Room and a given date D, `summarizeChangesSince(roomId, D)` SHALL return: all ADRs created after D (with adrId, title, date), all threads that reference the focus thread (with threadId, title, referenceType), and all threads that transitioned to SUPERSEDED after D (with threadId, title, supersededBy). The `totalChanges` count SHALL equal the sum of all three arrays' lengths.
+
+**Validates: Requirements 6.4**
+
+### Property 27: Embedding indexing on entity write
+
+*For any* Decision_Thread or ADR that is created or updated, calling `indexEntity` SHALL generate a Titan embedding vector of dimension 1536, persist it to DynamoDB with the correct entity reference keys (`EMB#{entityType}#{entityId}`), and store a summary of at most 200 characters. The embedding SHALL be retrievable by the `semanticSearch` function immediately after indexing completes.
+
+**Validates: Requirements 7.4**
+
+### Property 28: Single-option fallback with relaxation suggestions
+
+*For any* set of constraints where the AI Architect can identify only one viable architecture option, `proposeOptionsWithFallback` SHALL return a `ProposalResult` with kind `single_option` containing: the single viable ArchitectureOption (with summary ≤200 chars, ≥2 benefits, ≥2 risks, complexity rating) and a non-empty `relaxationSuggestions` array listing at least one constraint that could be relaxed to enable alternative options.
+
+**Validates: Requirements 3.5**
+
+### Property 29: Diagram generation for infrastructure decisions
+
+*For any* DECIDED thread where `isInfrastructureDecision` returns true, `generateDecisionDiagram` SHALL produce a `DiagramFile` containing valid .drawio XML with at least one component, at least one connection with data flow direction, and a non-empty fileName. The diagram SHALL be uploadable to S3 via `uploadDiagram`.
+
+**Validates: Requirements 8.1, 8.2**
+
+### Property 30: Option comparison diagram during deliberation
+
+*For any* set of 2-5 ArchitectureOptions in an IN_PROGRESS thread, `generateOptionComparisonDiagram` SHALL produce a `DiagramFile` where each option appears as a separately labeled section in the .drawio XML, each containing its proposed components and connections.
+
+**Validates: Requirements 8.3**
 
 ## Error Handling
 
@@ -727,6 +1027,7 @@ graph TD
 | Validation | `EMPTY_NAME`, `NAME_TOO_LONG`, `DUPLICATE_NAME`, `EMPTY_QUERY`, `INVALID_TRANSITION` | Return immediately, no retry | 400 with specific message |
 | Persistence | `WRITE_FAILURE`, `READ_FAILURE` | Retry up to 3× with exponential backoff (100ms base) | 503 if retries exhausted; preserve locally |
 | AI/Bedrock | `INVOCATION_FAILURE`, `RATE_LIMITED` | Retry up to 3× for transient; backoff for rate limit | 503 with "AI temporarily unavailable" |
+| Timeout | `TIMEOUT` (ADR gen: 30s, search: 2s) | Cancel operation; retry up to 3× for ADR; no retry for search | 504 with "operation timed out" + retry option |
 | Authorization | Token expired/invalid, team mismatch | No retry | 401 or 403; redirect to sign-in |
 | Not Found | Room/thread/ADR does not exist | No retry | 404 with entity type |
 | Structural | `RESPONSE_VALIDATION_FAILURE` | Retry once (AI may produce valid response on retry) | 500 with "unexpected response format" |
@@ -838,8 +1139,19 @@ Each correctness property from the design document maps to a single `fast-check`
 | 15: Empty query rejection | `decision-journal.ts` | Whitespace-only and empty strings |
 | 16: Cosine similarity properties | `decision-journal.ts` | Random pairs of equal-dimension vectors |
 | 17: Team-scoped access | `room-manager.ts` + auth | Random user/team/room combinations |
-| 18: User identity attribution | All creation functions | Random user IDs with entity creation |
-| 19: Retry exponential backoff | `dynamo.ts` | Random failure sequences (1-3 failures) |
+| 18: Admin-only management | `team-management.ts` | Random admin/member users invoking admin operations |
+| 19: Cannot remove last admin | `team-management.ts` | Teams with 1 admin, attempt remove/demote |
+| 20: User identity attribution | All creation functions | Random user IDs with entity creation |
+| 21: Retry exponential backoff | `dynamo.ts` | Random failure sequences (1-3 failures) |
+| 22: ADR generation timeout | `adr-generator.ts` | Mock Bedrock with configurable latency (0ms–60s) |
+| 23: Search timeout | `decision-journal.ts` | Mock DDB/embedding with configurable latency |
+| 24: Tradeoff change tracking | `ai-architect.ts` | Random before/after tables, verify diff completeness |
+| 25: Persist-before-acknowledge | Lambda handler | Mock DDB success/failure, verify response ordering |
+| 26: Room change summary | `cross-reference.ts` | Random rooms with threads/ADRs at various dates, verify completeness |
+| 27: Embedding indexing on write | `decision-journal.ts` | Mock Titan embedding, verify DDB upsert and retrievability |
+| 28: Single-option fallback | `ai-architect.ts` | Mock Bedrock returning 1 option, verify relaxation suggestions present |
+| 29: Diagram generation | `diagram-generator.ts` | Mock Claude .drawio output, verify XML structure and S3 upload |
+| 30: Option comparison diagram | `diagram-generator.ts` | Random 2-5 options, verify each appears as labeled section |
 
 ### Example-Based Unit Tests
 
